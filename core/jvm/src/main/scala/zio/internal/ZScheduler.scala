@@ -40,8 +40,7 @@ private final class ZScheduler extends Executor {
   @volatile private[this] var blockingLocations: Set[Trace] = Set.empty
 
   (0 until poolSize).foreach { workerId =>
-    val worker = makeWorker()
-    worker.setName(s"ZScheduler-Worker-$workerId")
+    val worker = makeWorker(s"ZScheduler-Worker-$workerId")
     worker.setDaemon(true)
     workers(workerId) = worker
   }
@@ -238,8 +237,7 @@ private final class ZScheduler extends Executor {
                 globalQueue.offerAll(runnables)
                 val worker = cache.poll(null)
                 if (worker eq null) {
-                  val worker = makeWorker()
-                  worker.setName(s"ZScheduler-$workerId")
+                  val worker = makeWorker(s"ZScheduler-$workerId")
                   worker.setDaemon(true)
                   workers(workerId) = worker
                   worker.start()
@@ -270,8 +268,8 @@ private final class ZScheduler extends Executor {
       }
     }
 
-  private[this] def makeWorker(): ZScheduler.Worker =
-    new ZScheduler.Worker { self =>
+  private[this] def makeWorker(name: String, stackSize: Int = FiberRuntime.MaxOperationsBeforeYield): ZScheduler.Worker =
+    new ZScheduler.Worker(name, stackSize) { self =>
       override def run(): Unit = {
         var currentBlocking = false
         var currentOpCount  = 0L
@@ -447,7 +445,14 @@ private[zio] object ZScheduler {
    * A `Worker` is a `Thread` that is responsible for executing actions
    * submitted to the scheduler.
    */
-  private sealed abstract class Worker extends Thread {
+  private sealed abstract class Worker(
+    name: String,
+    stackSize: Int
+ ) extends Thread(null, null, name, stackSize) {
+
+    def this(name: String) {
+      this(name, 0)
+    }
 
     /**
      * Whether this worker is currently active.

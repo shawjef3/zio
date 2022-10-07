@@ -21,7 +21,7 @@ import zio.stacktracer.TracingImplicits.disableAutoTrace
 import java.util.concurrent._
 import java.util.concurrent.atomic.AtomicInteger
 
-private[zio] final class NamedThreadFactory(name: String, daemon: Boolean) extends ThreadFactory {
+private[zio] final class NamedThreadFactory(name: String, daemon: Boolean, stackSize: Int = FiberRuntime.MaxOperationsBeforeYield) extends ThreadFactory {
 
   private val parentGroup = Thread.currentThread.getThreadGroup
   private val threadGroup = new ThreadGroup(parentGroup, name)
@@ -30,8 +30,7 @@ private[zio] final class NamedThreadFactory(name: String, daemon: Boolean) exten
   override def newThread(r: Runnable): Thread = {
     val newThreadNumber = threadCount.getAndIncrement()
 
-    val thread = new Thread(threadGroup, r)
-    thread.setName(s"$name-$newThreadNumber")
+    val thread = new Thread(threadGroup, r, s"$name-$newThreadNumber", stackSize)
     thread.setDaemon(daemon)
 
     thread
