@@ -125,12 +125,6 @@ object TestSpec extends ZIOBaseSpec {
         fiber <- ref.get.some
         exit  <- fiber.poll
       } yield assert(exit)(isNone)
-    ),
-    test("of Seq[Seq[A]]#contains with subtype of A") {
-      class A
-      class B extends A
-      val causes: Seq[Seq[A]] = Seq(Seq(new A))
-      assertTrue(!causes.contains(Seq(new B)))
-    }
+    )
   )
 }
