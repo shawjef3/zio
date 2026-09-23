@@ -74,10 +74,17 @@ private final class ZScheduler(autoBlocking: Boolean) extends Executor { parent 
 
   override private[zio] def claimInlineExecution(): Boolean = {
     val worker = ownWorkerOrNull()
-    if ((worker ne null) && worker.inlineExecutions < ZScheduler.MaxInlineExecutions) {
+    if (worker eq null) {
+      InlineStats.refusedNotWorker.increment() // TEMPORARY instrumentation
+      false
+    } else if (worker.inlineExecutions >= ZScheduler.MaxInlineExecutions) {
+      InlineStats.refusedAtCap.increment() // TEMPORARY instrumentation
+      false
+    } else {
       worker.inlineExecutions += 1
+      InlineStats.granted.increment() // TEMPORARY instrumentation
       true
-    } else false
+    }
   }
 
   override private[zio] def releaseInlineExecution(): Unit = {
@@ -502,7 +509,12 @@ private object ZScheduler {
    * 8 gives up almost all of the benefit, while 128 recovers most of what an
    * unbounded chain achieves.
    */
-  private final val MaxInlineExecutions = 128
+  // TEMPORARY, for the inline-chain sweep only. Not `private final val`, which
+  // the compiler would fold into the call site as a constant and make the
+  // property unreadable at runtime.
+  private val MaxInlineExecutions: Int =
+    try java.lang.Integer.getInteger("zio.maxInlineExecutions", 128).intValue()
+    catch { case _: Throwable => 128 }
 
   def markCurrentWorkerAsBlocking(): Unit = {
     val worker = workerOrNull()

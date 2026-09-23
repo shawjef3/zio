@@ -77,6 +77,14 @@ class SemaphoreContendedBenchmark {
     withoutSem = List.fill(fibers)(repeat(ops)(body))
   }
 
+  @Setup(Level.Iteration)
+  def resetStats(): Unit =
+    zio.internal.InlineStats.reset()
+
+  @TearDown(Level.Iteration)
+  def reportStats(): Unit =
+    println(zio.internal.InlineStats.report())
+
   @TearDown(Level.Trial)
   def tearDown(): Unit =
     if (counter.get() == 0L) throw new AssertionError("benchmark body never ran")
