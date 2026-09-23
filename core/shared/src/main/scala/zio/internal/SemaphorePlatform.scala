@@ -52,7 +52,16 @@ import scala.annotation.tailrec
 private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) extends Serializable {
   import SemaphorePlatform._
 
-  private[this] val permits = new AtomicLong(initialPermits)
+  // TEMPORARY, for the cache-contention experiment only.
+  //
+  // The CPU profile put two thirds of contended time inside this class, with
+  // the hot leaves being `AtomicLong.getAndAdd`, `compareAndSet` and `get` on
+  // `permits`, plus `hasLiveWaiter` reading `liveCount`. Both are written on
+  // essentially every acquisition and release, and as adjacent fields they can
+  // share a cache line, so every core doing either invalidates the other's
+  // copy. Padding them apart tests whether that sharing is actually costing
+  // anything, or whether the samples merely land where the work is.
+  private[this] val permits = new SemaphorePlatform.PaddedLong(initialPermits)
   private[this] val waiters = new ConcurrentLinkedQueue[SemaphoreWaiter]
 
   /**
@@ -85,7 +94,7 @@ private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) 
    * wins a waiter's terminal CAS, so it is exactly the number of fibers still
    * waiting for permits. This keeps [[awaiting]] O(1).
    */
-  private[this] val liveCount = new AtomicLong(0L)
+  private[this] val liveCount = new SemaphorePlatform.PaddedLong(0L)
 
   /**
    * The number of nodes physically present in [[waiters]], tombstones included.
@@ -476,6 +485,20 @@ private[zio] object SemaphorePlatform {
    * over many cancellations.
    */
   private final val SweepThreshold = 32L
+
+  /**
+   * TEMPORARY, for the cache-contention experiment only.
+   *
+   * An `AtomicLong` whose value sits alone on a cache line. The padding fields
+   * are `@volatile` so the JIT cannot elide them as unread, and there are
+   * enough of them on either side to cover a 128-byte line, which is the
+   * adjacent-line prefetch unit on x86 rather than the 64-byte line itself.
+   */
+  private[internal] final class PaddedLong(initial: Long) extends AtomicLong(initial) {
+    @volatile var p1, p2, p3, p4, p5, p6, p7, p8: Long = 0L
+    @volatile var q1, q2, q3, q4, q5, q6, q7, q8: Long = 0L
+    def sumPadding: Long                               = p1 + p2 + p3 + p4 + p5 + p6 + p7 + p8 + q1 + q2 + q3 + q4 + q5 + q6 + q7 + q8
+  }
 
   /**
    * A fiber waiting for permits.
