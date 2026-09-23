@@ -93,11 +93,15 @@ abstract class Executor extends ExecutorPlatformSpecific { self =>
    * Claims permission to run a fiber inline on the calling thread, returning
    * `true` if it was granted.
    *
-   * A fiber resumed inline runs until it suspends or finishes, and whatever it
-   * does may resume further fibers on the same stack, so the nesting has to be
-   * bounded somewhere. The bound belongs to the thread rather than to any
-   * fiber: the chain spans several different fibers, and what is being limited
-   * is the depth of one call stack.
+   * This asks a single question: may the caller run a fiber here, right now?
+   * That covers both halves of it. The thread must be one this executor owns,
+   * which is a stronger test than [[isCurrentThreadInExecutor]]: more than one
+   * scheduler can be alive at once, and running a fiber on a worker belonging
+   * to a different one would escape the executor it was locked to. And the
+   * nesting must be within budget, because a fiber resumed inline runs until it
+   * suspends or finishes and may resume further fibers on the same stack. That
+   * budget belongs to the thread rather than to any fiber, since the chain
+   * spans several of them and what is bounded is one call stack.
    *
    * Every claim that returns `true` must be matched by a
    * [[releaseInlineExecution]] in a `finally`. The default refuses, so an

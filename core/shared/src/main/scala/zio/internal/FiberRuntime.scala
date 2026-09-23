@@ -1587,7 +1587,7 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
     if (running.compareAndSet(false, true)) {
       val executor = getCurrentExecutor()
 
-      if (executor.isCurrentThreadInExecutor && executor.claimInlineExecution()) {
+      if (executor.claimInlineExecution()) {
         // `drainQueueOnCurrentThread` points `Fiber._currentFiber` at the fiber
         // it drains and restores only `running`, because its other callers are
         // the fiber itself and so have nothing to put back. Here the caller is
