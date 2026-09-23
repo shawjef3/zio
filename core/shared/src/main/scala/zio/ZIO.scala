@@ -6214,37 +6214,16 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
       with ZIO[Any, Nothing, Unit]
 
   /**
-   * Runs `first`, then runs `finalizer` as the stack unwinds past this frame,
-   * on every exit path, leaving the value or cause unchanged.
+   * The frame [[AcquireReleaseInline]] leaves on the stack: run `finalizer` as
+   * the stack unwinds past it, on every exit path, then carry on unwinding with
+   * the value or cause unchanged.
    *
-   * This exists for release actions that are a plain side effect and need no
-   * access to the exit value, as `Semaphore.withPermits` does. Expressing one
-   * as `exitWith` costs a [[FoldZIO]] frame, an `Exit` allocation on the
-   * success path, and a closure invocation that receives an exit it does not
-   * read; this costs a frame and a call. `Semaphore.withPermits` measured the
-   * difference at about 15ns per acquisition, against a total guarding cost
-   * there of about 90ns.
-   *
-   * It is deliberately not public. The finalizer runs while the fiber is
-   * unwinding, so it must not throw, must not suspend, and must be cheap. Those
-   * are the same obligations [[UpdateRuntimeFlags]] carries, and this is
+   * This is a continuation only, never an effect to evaluate, so it is reached
+   * solely by being pushed. The finalizer runs while the fiber is unwinding, so
+   * it must not throw, must not suspend, and must be cheap. Those are the same
+   * obligations [[UpdateRuntimeFlags]] carries as a continuation, and this is
    * modelled on it. It is not a substitute for `ensuring` or `acquireRelease`,
    * which handle effectful finalizers and their own failures.
-   */
-  private[zio] final case class OnExitEffect[R, E, A](
-    trace: Trace,
-    first: ZIO[R, E, A],
-    finalizer: () => Unit
-  ) extends Continuation
-      with ZIO[R, E, A]
-
-  /**
-   * The frame [[OnExitEffect]] and [[AcquireReleaseInline]] leave on the stack:
-   * run `finalizer` as the stack unwinds past it, on every exit path, then
-   * carry on unwinding with the value or cause unchanged.
-   *
-   * This is a continuation only, never an effect to evaluate, which is why it
-   * carries no inner effect the way [[OnExitEffect]] does.
    */
   private[zio] final case class RunFinalizer(trace: Trace, finalizer: () => Unit) extends Continuation
 

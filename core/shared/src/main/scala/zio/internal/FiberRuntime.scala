@@ -1352,13 +1352,6 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
               updateLastTrace(updateRuntimeFlags.trace)
               cur = patchRuntimeFlags(updateRuntimeFlags.update, null, Exit.unit)
 
-            case onExit: ZIO.OnExitEffect[Any, Any, Any] =>
-              val trace = onExit.trace
-              updateLastTrace(trace)
-
-              stackIndex = pushStackFrame(ZIO.RunFinalizer(trace, onExit.finalizer), stackIndex)
-              cur = onExit.first
-
             case ar: ZIO.AcquireReleaseInline[Any, Any, Any] =>
               val trace = ar.trace
               updateLastTrace(trace)

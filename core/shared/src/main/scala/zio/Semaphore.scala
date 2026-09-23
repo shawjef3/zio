@@ -170,7 +170,11 @@ object Semaphore {
           // By name: on the path this exists to make cheap, it is never built.
           () =>
             ZIO.uninterruptibleMask { restore =>
-              val body = ZIO.OnExitEffect(trace, restore(zio), () => state.release(n))
+              def body =
+                restore(zio).exitWith { exit =>
+                  state.release(n)
+                  exit
+                }
 
               if (state.tryAcquire(n)) body
               else enqueueAndAwait(n, restore).flatMap(_ => body)
