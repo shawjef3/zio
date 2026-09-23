@@ -64,14 +64,6 @@ private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) 
   private[this] val drainLock = new ReentrantLock()
 
   /**
-   * Counts requests to hand out permits that have not yet been served. A thread
-   * that cannot take [[drainLock]] records its request here rather than
-   * leaving, so its permits cannot be stranded by a lock holder that has
-   * already taken its last look at the counter.
-   */
-  private[this] val drainRequests = new AtomicLong(0L)
-
-  /**
    * Serializes [[enqueue]] against itself, so that fibers are queued in the
    * order they arrive. Held only across the counter bump and the insertion,
    * never across a drain or any user code, and never taken by the uncontended
@@ -224,106 +216,45 @@ private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) 
     }
 
   /**
-   * Hands out permits, ensuring that the work happens even when several threads
-   * ask at once.
+   * Hands out permits to queued waiters, and wakes whoever was granted.
    *
-   * Only one thread hands out permits at a time: the work is a handful of CAS
+   * Only one thread hands out permits at a time. The work is a handful of CAS
    * operations on the head of the queue, the counter, and the waiter state
-   * together, and a thread that cannot get in has already done its part by
-   * returning its permits to the counter.
+   * together, so it is short, bounded, and never blocks: the lock is held
+   * across [[drainLoop]] alone, never across user code and never across a
+   * wake-up.
    *
-   * When the queue is empty there is nothing to hand out at all and the whole
-   * dance is skipped, so an uncontended release is a `getAndAdd` plus a `peek`.
+   * A thread that finds the lock taken waits for it rather than leaving. It
+   * must not simply leave, because its permits could then be stranded: the
+   * holder may already have made its last read of the counter. Waiting is
+   * enough to rule that out on its own. Every caller adds its permits to the
+   * counter, or publishes its waiter, *before* calling this, so a thread that
+   * enters the lock afterwards re-reads both and sees them.
    *
-   * A thread that fails to take the lock must not simply leave, or its permits
-   * could be stranded: the holder may have already made its last read of the
-   * counter. Instead it bumps `drainRequests`, and the holder re-runs until it
-   * sees no new requests, so the permits are always eventually handed out.
-   *
-   * Neither path holds the lock across the wake-ups; see [[tryDrainAndWake]].
+   * When the queue is empty there is nothing to hand out at all and the lock is
+   * never touched, so an uncontended release is a `getAndAdd` plus a `peek`.
    */
   private def drain(): Unit = {
     // Nothing is queued, so there is nobody to hand permits to and no
-    // tombstones to sweep. This has to come before the increment below: an
-    // early-out taken after it would leave `drainRequests` permanently
-    // non-zero and send the next real drain round its loop for nothing.
+    // tombstones to sweep.
     //
     // A waiter enqueued just after this read cannot be stranded, because
     // `enqueue` drains itself after publishing the node, and `release` adds its
     // permits to the counter before calling us, so that drain sees them.
     if (waiters.peek() eq null) return
 
-    // Fast path: nobody else is draining, so there is nobody to signal. Taking
-    // the lock first makes the whole request-counter protocol unnecessary in
-    // the common case, where drains do not overlap.
-    //
-    // This is not limited to a single waiter. `drainLoop` re-reads the head and
-    // the permit counter on every iteration and only ever grants by CAS, so a
-    // thread holding the lock correctly serves as many waiters as the permits
-    // allow, picking up concurrent releases as it goes. What the counter
-    // protects against is a *second drainer* being turned away, not a backlog
-    // of waiters.
-    if (tryDrainAndWake(clearRequests = false)) {
-      // Somebody may have been turned away while we held the lock, after we had
-      // already made our last read of the counter. Their request is recorded,
-      // so serve it.
-      if (drainRequests.get() != 0L) drainContended()
-    } else drainContended()
+    drainLock.lock()
+    val wakes =
+      try drainLoop()
+      finally drainLock.unlock()
+
+    // Waking runs `FiberRuntime.tell`, which offers to the scheduler's run
+    // queue and may `LockSupport.unpark` a parked worker, so it happens after
+    // the lock is released rather than holding it across a syscall per granted
+    // waiter. The permits themselves were handed out under the lock, so who
+    // gets what is already decided; all that is deferred is telling the fibers.
+    wake(wakes)
   }
-
-  /**
-   * The slow half of [[drain]], taken once a `tryLock` has failed or a request
-   * arrived too late for the drain that was in flight.
-   *
-   * The increment must happen before the `tryLock` attempt. A thread that
-   * incremented and then failed to take the lock is guaranteed to be served:
-   * either the holder has yet to run `drainLoop`, in which case it will see the
-   * permits, or it has already cleared the counter, in which case our increment
-   * lands after that clear and its exit re-check sees it.
-   */
-  private def drainContended(): Unit = {
-    var continue = true
-    while (continue) {
-      // Signal that there is work to do. A thread that cannot take the lock has
-      // still recorded its request here, and the lock holder will see it.
-      drainRequests.incrementAndGet()
-
-      if (tryDrainAndWake(clearRequests = true)) {
-        // Re-check after releasing: if somebody asked while we were inside,
-        // their permits still need handing out.
-        continue = drainRequests.get() != 0L
-      } else {
-        // Somebody else holds the lock. Our request is recorded, so they (or
-        // whoever takes the lock next) will do our work for us.
-        continue = false
-      }
-    }
-  }
-
-  /**
-   * Takes [[drainLock]], hands out permits, releases the lock, and only then
-   * wakes whoever was granted. Returns `false` if the lock was not free.
-   *
-   * This is the only place the lock is taken, so the deferred wake is a
-   * property of the drain rather than something each caller has to remember:
-   * waking runs `FiberRuntime.tell`, which offers to the scheduler's run queue
-   * and may `LockSupport.unpark` a parked worker, so waking under the lock
-   * would hold it across a syscall per granted waiter.
-   *
-   * `clearRequests` is set by the contended path, which must take ownership of
-   * the outstanding requests inside the lock: any request arriving after that
-   * bumps the counter again and sends it round its loop once more.
-   */
-  private def tryDrainAndWake(clearRequests: Boolean): Boolean =
-    if (drainLock.tryLock()) {
-      val wakes =
-        try {
-          if (clearRequests) drainRequests.set(0L)
-          drainLoop()
-        } finally drainLock.unlock()
-      wake(wakes)
-      true
-    } else false
 
   /**
    * Hands permits to queued waiters for as long as the waiter at the head of
