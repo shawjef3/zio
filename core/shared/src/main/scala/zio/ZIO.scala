@@ -833,10 +833,32 @@ sealed trait ZIO[-R, +E, +A]
     scopeOverride: FiberScope
   )(implicit trace: Trace): URIO[R, Fiber.Runtime[E, A]] =
     ZIO.withFiberRuntime[R, Nothing, Fiber.Runtime[E, A]] { (parentFiber, parentStatus) =>
-      val f = ZIO.succeed(
-        ZIO.unsafe.fork(trace, self, parentFiber, parentStatus.runtimeFlags, scopeOverride)(Unsafe)
-      )
-      if (parentFiber.shouldYieldBeforeFork()) ZIO.yieldNow *> f else f
+      // The fork happens here, inside the `Stateful` callback, and is returned as
+      // an `Exit`. Do not fold the two branches into one `ZIO.succeed(fork(...))`,
+      // even though that reads more simply: it is how this used to be written, and
+      // it makes the JIT's treatment of the run loop depend on luck.
+      //
+      // A `ZIO.succeed` thunk is evaluated through the run loop's single `Sync`
+      // call site, whose type profile is shared with every other `ZIO.succeed` in
+      // the program. In a small program that site sees only a couple of lambdas,
+      // so C2 inlines them there, and whether its final compile of `runLoop` also
+      // inlined this fork path came down to compile timing. When it did, the fork
+      // machinery used up `runLoop`'s inlining budget and hot call sites were left
+      // as calls: in `SemaphoreContendedBenchmark` at one permit, about one JVM in
+      // six ran 30% slower for its whole life. Forking here keeps the fork out of
+      // that call site entirely, which removed the slow JVMs (0 of 24, against 4
+      // of 24) and also saves a `Sync` node and a closure per fork.
+      //
+      // Forking eagerly is safe: the flags and trace are the ones the thunk would
+      // have captured, and an interruption landing between this callback and the
+      // next instruction is an interleaving the thunk version already allowed. The
+      // yield-before-fork branch must stay lazy, since the fork has to happen after
+      // the yield.
+      if (parentFiber.shouldYieldBeforeFork())
+        ZIO.yieldNow *> ZIO.succeed(
+          ZIO.unsafe.fork(trace, self, parentFiber, parentStatus.runtimeFlags, scopeOverride)(Unsafe)
+        )
+      else Exit.succeed(ZIO.unsafe.fork(trace, self, parentFiber, parentStatus.runtimeFlags, scopeOverride)(Unsafe))
     }
 
   /**
