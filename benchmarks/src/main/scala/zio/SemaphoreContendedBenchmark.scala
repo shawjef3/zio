@@ -4,7 +4,7 @@ import org.openjdk.jmh.annotations.{Scope => JScope, _}
 import zio.BenchmarkUtil._
 
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.LongAdder
 
 /**
  * Measures `withPermit` with real suspended fibers, in the regime where permits
@@ -23,28 +23,49 @@ import java.util.concurrent.atomic.AtomicLong
  *     acquire/release traffic rather than construction.
  *   - The guarded effect is a counter increment rather than a `Blackhole`
  *     consume, so the body is a few nanoseconds and what dominates is the
- *     acquire/release pair and the suspension it causes.
+ *     acquire/release pair and the suspension it causes. The counter is a
+ *     `LongAdder`: its cells are padded, so neither the counter's own
+ *     contention nor where it happens to sit next to the semaphore shows up in
+ *     the score.
  *
  * What remains inside the op is forking the fibers and joining them, which
  * cannot be hoisted: the contention being measured only exists while several
  * fibers are running at once. [[baseline]] measures exactly that much with the
  * semaphore removed, so the difference is what acquisition costs.
  *
- * Run this with at least 5 forks. The remaining variance is between forks
- * rather than within them -- how the JIT and the scheduler happen to settle for
- * a given JVM -- so iterations do not damp it but forks do. At `-f 2` the
- * single-permit row lands around 16% error, at `-f 5` around 2%:
+ * Almost all of the variance is between JVMs rather than within one: once
+ * settled, a fork's iterations agree to about 1%, while forks differ by far
+ * more. Iterations therefore do not damp it and forks do. Two effects set a
+ * fork's level:
+ *
+ *   - Heap layout. Which of the semaphore's objects share a cache line is
+ *     decided when they are promoted to the old generation, about 15 young
+ *     collections in, and then fixed for the life of the JVM. Keep at least 10
+ *     one-second warmup iterations, or some forks are measured before they
+ *     settle; two measurement iterations are enough after that.
+ *   - JIT inlining in the run loop. This benchmark's body and the runtime's own
+ *     code share call sites in `FiberRuntime.runLoop`, and in a program this
+ *     small C2 inlines at them depending on compile timing. Forks used to run
+ *     through one such site, and about one JVM in six settled 30% low at one
+ *     permit until `ZIO.forkWithScopeOverride` was changed to fork outside it.
+ *     If forks start splitting into a fast and a slow group again, suspect the
+ *     same kind of inlining race before anything in the semaphore, and look at
+ *     the fraction of slow forks, not only the mean. Do not hide it with JVM
+ *     flags such as `-XX:-TieredCompilation`, which measure a configuration
+ *     production does not run.
+ *
+ * Use at least 12 forks, one parameter point per run:
  *
  * {{{
- * benchmarks/jmh:run -f 5 -wi 10 -i 10 zio.SemaphoreContendedBenchmark
+ * benchmarks/jmh:run -f 12 -wi 10 -i 2 -p permits=5 zio.SemaphoreContendedBenchmark
  * }}}
  */
 @State(JScope.Thread)
 @BenchmarkMode(Array(Mode.Throughput))
 @OutputTimeUnit(TimeUnit.SECONDS)
-@Measurement(iterations = 10, timeUnit = TimeUnit.SECONDS, time = 1)
+@Measurement(iterations = 2, timeUnit = TimeUnit.SECONDS, time = 1)
 @Warmup(iterations = 10, timeUnit = TimeUnit.SECONDS, time = 1)
-@Fork(2)
+@Fork(12)
 class SemaphoreContendedBenchmark {
 
   /** Fibers competing for the semaphore. */
@@ -63,7 +84,7 @@ class SemaphoreContendedBenchmark {
    * acquisition can be optimised away, and read in `@TearDown` so the counter
    * itself stays live.
    */
-  private[this] val counter = new AtomicLong(0L)
+  private[this] val counter = new LongAdder
 
   private var withSem: List[ZIO[Any, Nothing, Unit]]    = _
   private var withoutSem: List[ZIO[Any, Nothing, Unit]] = _
@@ -71,7 +92,7 @@ class SemaphoreContendedBenchmark {
   @Setup(Level.Trial)
   def setup(): Unit = {
     val sem  = unsafeRun(Semaphore.make(permits.toLong))
-    val body = ZIO.succeed(counter.incrementAndGet()).unit
+    val body = ZIO.succeed(counter.increment())
 
     withSem = List.fill(fibers)(repeat(ops)(sem.withPermit(body)))
     withoutSem = List.fill(fibers)(repeat(ops)(body))
@@ -79,7 +100,7 @@ class SemaphoreContendedBenchmark {
 
   @TearDown(Level.Trial)
   def tearDown(): Unit =
-    if (counter.get() == 0L) throw new AssertionError("benchmark body never ran")
+    if (counter.sum() == 0L) throw new AssertionError("benchmark body never ran")
 
   /** Fibers contending for `permits` permits. */
   @Benchmark
