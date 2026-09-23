@@ -23,6 +23,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.locks.ReentrantLock
 import java.util.concurrent.atomic.{AtomicLong, AtomicReference}
 import scala.annotation.tailrec
+import scala.collection.mutable.ArrayBuffer
 
 /**
  * Implementation of [[zio.Semaphore]] built on an `AtomicLong` permit counter
@@ -335,17 +336,17 @@ private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) 
    *
    * Returns the wake-ups the caller must perform once it has released the lock:
    * `null` if there are none, a single callback if exactly one waiter was
-   * granted, and otherwise a `WakeList` of them in the order they were granted.
-   * The permits themselves are handed out here, under the lock, so who gets
-   * what is fully decided before any of these run; all that is deferred is
+   * granted, and otherwise an `ArrayBuffer` of them in the order they were
+   * granted. The permits themselves are handed out here, under the lock, so who
+   * gets what is fully decided before any of these run; all that is deferred is
    * telling the fibers about it.
    */
   private def drainLoop(): AnyRef = {
     // The overwhelmingly common case is granting zero or one waiter, so the
     // first callback is kept in a local and no list is allocated unless a
     // single drain actually grants more than one.
-    var firstWake: AnyRef   = null
-    var moreWakes: WakeList = null
+    var firstWake: AnyRef              = null
+    var moreWakes: ArrayBuffer[AnyRef] = null
 
     var continue = true
     while (continue) {
@@ -372,7 +373,7 @@ private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) 
               if (firstWake eq null) firstWake = cb
               else {
                 if (moreWakes eq null) {
-                  moreWakes = new WakeList
+                  moreWakes = new ArrayBuffer[AnyRef](8)
                   moreWakes += firstWake
                 }
                 moreWakes += cb
@@ -396,10 +397,16 @@ private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) 
    */
   private def wake(wakes: AnyRef): Unit =
     wakes match {
-      case null => ()
-      case list: WakeList =>
-        list.runAllButLast()
-        wakeOne(list.last)
+      case null                                 => ()
+      case list: ArrayBuffer[AnyRef @unchecked] =>
+        // All but the last go through the scheduler; the last is resumed on this
+        // thread by `wakeOne`, which only one of them can be.
+        var i = 0
+        while (i < list.size - 1) {
+          list(i).asInstanceOf[Exit[Nothing, Unit] => Unit](Exit.unit)
+          i += 1
+        }
+        wakeOne(list(list.size - 1))
       case cb => wakeOne(cb)
     }
 
@@ -428,6 +435,13 @@ private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) 
       case c: FiberRuntime.AsyncContWith.Callback =>
         c.completeZIOInline(Exit.unit)
         ()
+      // In practice unreachable: `initiateAsync` hands `ZIO.async` a
+      // `Callback` and nothing else, so every callback registered on a waiter
+      // is one. `ZIO.async` types its argument as a plain function, though, so
+      // that is an invariant of the runtime rather than something this can
+      // rely on statically. Falling back to calling it costs a branch the JIT
+      // will predict perfectly and keeps a future change to that signature
+      // from turning into a `ClassCastException` here.
       case other =>
         other.asInstanceOf[Exit[Nothing, Unit] => Unit](Exit.unit)
     }
@@ -562,30 +576,5 @@ private[zio] object SemaphorePlatform {
   private[internal] object Claim {
     val Cancelled: AnyRef = new Object
     val NoWaiter: AnyRef  = new Object
-  }
-
-  /**
-   * The pending wake-ups of a drain that granted more than one waiter, in the
-   * order they were granted.
-   */
-  private[internal] final class WakeList {
-    private[this] val elems = new scala.collection.mutable.ArrayBuffer[AnyRef](8)
-
-    def +=(cb: AnyRef): Unit = {
-      elems += cb
-      ()
-    }
-
-    /** Wakes everything except the last, which the caller handles. */
-    def runAllButLast(): Unit = {
-      val n = elems.size
-      var i = 0
-      while (i < n - 1) {
-        elems(i).asInstanceOf[Exit[Nothing, Unit] => Unit](Exit.unit)
-        i += 1
-      }
-    }
-
-    def last: AnyRef = elems(elems.size - 1)
   }
 }
