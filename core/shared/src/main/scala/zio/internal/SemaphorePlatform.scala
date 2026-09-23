@@ -49,10 +49,17 @@ import scala.annotation.tailrec
  *     rather than by queueing, so barging has much less to win than it does for
  *     a semaphore that parks threads.
  */
-private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) extends Serializable {
+private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean)
+    extends SemaphorePermitsPadding(initialPermits)
+    with Serializable {
   import SemaphorePlatform._
 
-  private[this] val permits = new AtomicLong(initialPermits)
+  // The permit counter itself lives in `SemaphorePermitsPadding`, which on the
+  // JVM keeps it on a cache line of its own, and is reached only through
+  // `getPermits`, `compareAndSetPermits` and `getAndAddPermits`. Do not bring it
+  // back here as an `AtomicLong`: where the garbage collector happened to put
+  // that object decided, JVM by JVM, how fast a contended semaphore ran. See
+  // `SemaphorePermitsPadding` for the measurements and what to keep intact.
   private[this] val waiters = new ConcurrentLinkedQueue[SemaphoreWaiter]
 
   /**
@@ -108,7 +115,7 @@ private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) 
    * anybody from acquiring, and the raw count is reported as-is.
    */
   def available(): Long =
-    if (fair && hasLiveWaiter) 0L else permits.get()
+    if (fair && hasLiveWaiter) 0L else getPermits()
 
   /**
    * The number of fibers currently waiting for permits.
@@ -137,9 +144,9 @@ private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) 
   def tryAcquire(n: Long): Boolean =
     if (fair && hasLiveWaiter) false
     else {
-      val current = permits.get()
+      val current = getPermits()
       if (current < n) false
-      else if (permits.compareAndSet(current, current - n)) true
+      else if (compareAndSetPermits(current, current - n)) true
       else tryAcquire(n)
     }
 
@@ -196,7 +203,7 @@ private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) 
    * Returns `n` permits and hands as many as possible to queued waiters.
    */
   def release(n: Long): Unit = {
-    permits.getAndAdd(n)
+    getAndAddPermits(n)
     drain()
     ()
   }
@@ -356,9 +363,9 @@ private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) 
         if (waiters.poll() ne null) queuedCount.decrementAndGet()
       } else {
         val n       = head.n
-        val current = permits.get()
+        val current = getPermits()
         if (current < n) continue = false
-        else if (permits.compareAndSet(current, current - n)) {
+        else if (compareAndSetPermits(current, current - n)) {
           // We hold the drain lock, so `head` is still the head and this poll
           // returns it. `poll` rather than `remove(Object)` keeps this O(1):
           // `remove` scans the queue, making a drain of k waiters O(k^2).
@@ -366,7 +373,7 @@ private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) 
           // A concurrent cancellation may still beat us to the waiter, in which
           // case the permits are ours to return.
           head.claim() match {
-            case SemaphorePlatform.Claim.Cancelled => permits.getAndAdd(n)
+            case SemaphorePlatform.Claim.Cancelled => getAndAddPermits(n)
             case SemaphorePlatform.Claim.NoWaiter  => ()
             case cb =>
               if (firstWake eq null) firstWake = cb
