@@ -396,10 +396,17 @@ private[zio] final class SemaphorePlatform(initialPermits: Long, fair: Boolean) 
    */
   private def wake(wakes: AnyRef): Unit =
     wakes match {
-      case null => ()
+      case null           => ()
       case list: WakeList =>
-        list.runAllButLast()
-        wakeOne(list.last)
+        // The thread can run only one of them inline, and it should be the one
+        // granted first. `drainLoop` grants in FIFO order, so `head` is the
+        // longest-waiting fiber, the one the fair ordering promised to serve
+        // first. Resuming the *last* instead handed the warm thread to the
+        // most recently queued fiber and sent the one at the front of the line
+        // through the scheduler, inverting the ordering guarantee exactly when
+        // a drain is granting several waiters at once.
+        list.runAllButFirst()
+        wakeOne(list.head)
       case cb => wakeOne(cb)
     }
 
@@ -576,16 +583,16 @@ private[zio] object SemaphorePlatform {
       ()
     }
 
-    /** Wakes everything except the last, which the caller handles. */
-    def runAllButLast(): Unit = {
+    /** Wakes everything except the first, which the caller handles. */
+    def runAllButFirst(): Unit = {
       val n = elems.size
-      var i = 0
-      while (i < n - 1) {
+      var i = 1
+      while (i < n) {
         elems(i).asInstanceOf[Exit[Nothing, Unit] => Unit](Exit.unit)
         i += 1
       }
     }
 
-    def last: AnyRef = elems(elems.size - 1)
+    def head: AnyRef = elems(0)
   }
 }
