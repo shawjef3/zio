@@ -50,6 +50,12 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
   private var _stackSize      = 0
   private var _isInterrupted  = false
 
+  // Run loop state, kept in fields so that ZIO#step implementations can reach it; see runLoop.
+  private var _minStackIndex              = 0
+  private var _loopDepth                  = 0
+  private var _loopOps                    = 0
+  private var _loopResult: Exit[Any, Any] = null
+
   private var _forksSinceYield = 0
 
   private[zio] def shouldYieldBeforeFork(): Boolean =
@@ -1077,8 +1083,238 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
   }
 
   /**
+   * Pops continuations off the stack, feeding them `value0`, until one of them
+   * produces an effect or the stack reaches `_minStackIndex`. Returns the
+   * effect, or `null` if the stack was exhausted, in which case the run loop's
+   * result is left in `_loopResult`. `original` is returned as the result when
+   * the value was not transformed, and may be `null`.
+   */
+  private def unwindSuccess(value0: Any, original: Exit.Success[Any]): ZIO.Erased = {
+    val minStackIndex   = _minStackIndex
+    var value           = value0
+    var stackIndex      = _stackSize
+    var cur: ZIO.Erased = null
+
+    while ((cur eq null) && stackIndex > minStackIndex) {
+      stackIndex -= 1
+
+      val continuation = _stack(stackIndex)
+
+      popStackFrame(stackIndex)
+
+      continuation match {
+        case flatMap: ZIO.FlatMap[Any, Any, Any, Any] =>
+          cur = flatMap.successK(value)
+
+        case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
+          cur = foldZIO.successK(value)
+
+        case map: ZIO.Mapped[Any, Any, Any, Any] =>
+          value = map.successK(value)
+
+        case update =>
+          val updateFlags = update.asInstanceOf[ZIO.UpdateRuntimeFlags]
+          if (!ignoreFlagsUpdate(updateFlags.update, stackIndex)) {
+            cur = patchRuntimeFlags(updateFlags.update, null, null)
+          }
+      }
+    }
+
+    if (cur eq null) {
+      _loopResult =
+        if ((original ne null) && (original.value.asInstanceOf[AnyRef] eq value.asInstanceOf[AnyRef])) original
+        else Exit.succeed(value)
+    }
+    cur
+  }
+
+  private[zio] def stepSuccess(success: Exit.Success[Any]): ZIO.Erased =
+    unwindSuccess(success.value, success)
+
+  private[zio] def stepSync(sync: ZIO.Sync[_]): ZIO.Erased = {
+    updateLastTrace(sync.trace)
+    unwindSuccess(sync.eval(), null)
+  }
+
+  private[zio] def stepFailure(failure: Exit.Failure[Any]): ZIO.Erased = {
+    val minStackIndex   = _minStackIndex
+    var cause           = failure.cause
+    var stackIndex      = _stackSize
+    var cur: ZIO.Erased = null
+
+    while ((cur eq null) && stackIndex > minStackIndex) {
+      stackIndex -= 1
+
+      val continuation = _stack(stackIndex)
+
+      popStackFrame(stackIndex)
+
+      continuation match {
+        case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
+          if (shouldInterrupt()) {
+            cause = cause.stripFailures
+          } else {
+            cur = foldZIO.failureK(cause)
+          }
+
+        case updateFlags: ZIO.UpdateRuntimeFlags if !ignoreFlagsUpdate(updateFlags.update, stackIndex) =>
+          cause = patchRuntimeFlagsCause(updateFlags.update, cause)
+
+        case _ => ()
+      }
+    }
+
+    if (cur eq null) {
+      _loopResult =
+        if (cause eq failure.cause) failure
+        else Exit.Failure(cause)
+    }
+    cur
+  }
+
+  private[zio] def stepFlatMap(flatmap0: ZIO.FlatMap[_, _, _, _]): ZIO.Erased = {
+    val flatmap = flatmap0.asInstanceOf[ZIO.FlatMap[Any, Any, Any, Any]]
+    updateLastTrace(flatmap.trace)
+
+    val first = flatmap.first
+
+    if (first eq ZIO.unit) flatmap.successK(())
+    else {
+      pushStackFrame(flatmap, _stackSize)
+      first
+    }
+  }
+
+  private[zio] def stepFoldZIO(fold: ZIO.FoldZIO[_, _, _, _, _]): ZIO.Erased = {
+    updateLastTrace(fold.trace)
+    pushStackFrame(fold, _stackSize)
+    fold.first.asInstanceOf[ZIO.Erased]
+  }
+
+  private[zio] def stepMapped(map: ZIO.Mapped[_, _, _, _]): ZIO.Erased = {
+    updateLastTrace(map.trace)
+    pushStackFrame(map, _stackSize)
+    map.first.asInstanceOf[ZIO.Erased]
+  }
+
+  private[zio] def stepStateful(stateful0: ZIO.Stateful[_, _, _]): ZIO.Erased = {
+    val stateful = stateful0.asInstanceOf[ZIO.Stateful[Any, Any, Any]]
+    val trace    = stateful.trace
+    updateLastTrace(trace)
+
+    stateful.onState(
+      self.asInstanceOf[FiberRuntime[Any, Any]],
+      Fiber.Status.Running(_runtimeFlags, trace)
+    )
+  }
+
+  private[zio] def stepAsync(async0: ZIO.Async[_, _, _]): ZIO.Erased = {
+    val async = async0.asInstanceOf[ZIO.Async[Any, Any, Any]]
+    updateLastTrace(async.trace)
+    var cur = initiateAsync(async.registerCallback)
+
+    if (cur eq null) {
+      cur = drainQueueAfterAsync()
+    }
+
+    if (cur eq null) {
+      self._blockingOn = async.blockingOn
+      return null
+    }
+
+    self._asyncContWith = AsyncContWith.`null`
+
+    if (shouldInterrupt()) {
+      cur = Exit.failCause(getInterruptedCause())
+    }
+    cur
+  }
+
+  private[zio] def stepDynamicNoBox(update1: ZIO.UpdateRuntimeFlagsWithin.DynamicNoBox[_, _, _]): ZIO.Erased = {
+    val update0 = update1.asInstanceOf[ZIO.UpdateRuntimeFlagsWithin.DynamicNoBox[Any, Any, Any]]
+    val trace   = update0.trace
+    updateLastTrace(trace)
+    val updateFlags     = update0.update
+    val oldRuntimeFlags = _runtimeFlags
+    val newRuntimeFlags = RuntimeFlags.patch(updateFlags)(oldRuntimeFlags)
+
+    if (oldRuntimeFlags == newRuntimeFlags) {
+      // No change, short circuit:
+      update0.f(oldRuntimeFlags)
+    } else if (RuntimeFlags.interruptible(newRuntimeFlags) && isInterrupted()) {
+      // One more chance to short circuit: if we're immediately going to interrupt.
+      // Interruption will cause immediate reversion of the flag, so as long as we
+      // "peek ahead", there's no need to set them to begin with.
+      Exit.Failure(getInterruptedCause())
+    } else {
+      // Impossible to short circuit, so record the changes:
+      patchRuntimeFlagsOnly(updateFlags)
+      val revertFlags = RuntimeFlags.diff(newRuntimeFlags, oldRuntimeFlags)
+
+      // Since we updated the flags, we need to revert them:
+      val k = ZIO.UpdateRuntimeFlags(trace, revertFlags)
+
+      pushStackFrame(k, _stackSize)
+      update0.f(oldRuntimeFlags)
+    }
+  }
+
+  private[zio] def stepWhileLoop(iterate0: ZIO.WhileLoop[_, _, _]): ZIO.Erased = {
+    val iterate = iterate0.asInstanceOf[ZIO.WhileLoop[Any, Any, Any]]
+    updateLastTrace(iterate.trace)
+
+    val check         = iterate.check
+    val stackIndex    = pushStackFrame(iterate.k, _stackSize)
+    val minStackIndex = _minStackIndex
+    val depth         = _loopDepth
+    var ops           = _loopOps
+
+    var cur: ZIO.Erased = null
+
+    while ((cur eq null) && check()) {
+      val exit =
+        try runLoop(iterate.body(), stackIndex, stackIndex, depth + 1, ops)
+        finally {
+          // The nested loop overwrote the loop state; restore ours.
+          _minStackIndex = minStackIndex
+          _loopDepth = depth
+        }
+      exit match {
+        case s: Exit.Success[Any] =>
+          iterate.process(s.value)
+        case null =>
+          return null
+        case failure =>
+          cur = failure
+      }
+      ops += 1
+    }
+
+    _loopOps = ops
+    popStackFrame(stackIndex - 1)
+
+    if (cur eq null) Exit.unit else cur
+  }
+
+  private[zio] def stepYieldNow(yieldNow: ZIO.YieldNow): ZIO.Erased = {
+    updateLastTrace(yieldNow.trace)
+    inbox.add(FiberMessage.resumeUnit)
+    null
+  }
+
+  private[zio] def stepUpdateRuntimeFlags(updateRuntimeFlags: ZIO.UpdateRuntimeFlags): ZIO.Erased = {
+    updateLastTrace(updateRuntimeFlags.trace)
+    patchRuntimeFlags(updateRuntimeFlags.update, null, Exit.unit)
+  }
+
+  /**
    * The main run-loop for evaluating effects. This method is recursive,
    * utilizing JVM stack space.
+   *
+   * Each node evaluates itself through `ZIO#step`, which returns the next
+   * effect, or `null` when the loop must return `_loopResult` (an `Exit`, or
+   * `null` when the fiber suspended). The stack index lives in `_stackSize`,
+   * and the loop bounds in `_minStackIndex`, `_loopDepth` and `_loopOps`.
    *
    * '''NOTE''': This method must be invoked by the fiber itself.
    */
@@ -1091,16 +1327,19 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
   ): Exit[Any, Any] = {
     assert(DisableAssertions || running.get)
 
-    // Note that assigning `cur` as the result of `try` or `if` can cause Scalac to box local variables.
-    var cur        = effect
-    var ops        = currentOps
-    var stackIndex = startStackIndex
-
     if (currentDepth >= FiberRuntime.MaxDepthBeforeTrampoline) {
       inbox.add(FiberMessage.Resume(effect))
 
       return null
     }
+
+    // Note that assigning `cur` as the result of `try` or `if` can cause Scalac to box local variables.
+    var cur = effect
+
+    _stackSize = startStackIndex
+    _minStackIndex = minStackIndex
+    _loopDepth = currentDepth
+    _loopOps = currentOps
 
     while (true) {
       if (RuntimeFlags.opSupervision(_runtimeFlags)) {
@@ -1109,7 +1348,8 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
 
       cur = drainQueueWhileRunning(cur)
 
-      ops += 1
+      val ops = _loopOps + 1
+      _loopOps = ops
 
       if (ops > FiberRuntime.MaxOperationsBeforeYield && RuntimeFlags.cooperativeYielding(_runtimeFlags)) {
         updateLastTrace(cur.trace)
@@ -1118,236 +1358,18 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
         return null
       } else {
         try {
-          cur match {
-            case success: Exit.Success[Any] =>
-              var value = success.value
-
-              cur = null
-
-              while ((cur eq null) && stackIndex > minStackIndex) {
-                stackIndex -= 1
-
-                val continuation = _stack(stackIndex)
-
-                popStackFrame(stackIndex)
-
-                continuation match {
-                  case flatMap: ZIO.FlatMap[Any, Any, Any, Any] =>
-                    cur = flatMap.successK(value)
-
-                  case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
-                    cur = foldZIO.successK(value)
-
-                  case map: ZIO.Mapped[Any, Any, Any, Any] =>
-                    value = map.successK(value)
-
-                  case update =>
-                    val updateFlags = update.asInstanceOf[ZIO.UpdateRuntimeFlags]
-                    if (!ignoreFlagsUpdate(updateFlags.update, stackIndex)) {
-                      cur = patchRuntimeFlags(updateFlags.update, null, null)
-                    }
-                }
-              }
-
-              if (cur eq null) {
-                return {
-                  if (success.value.asInstanceOf[AnyRef] eq value.asInstanceOf[AnyRef]) success
-                  else Exit.succeed(value)
-                }
-              }
-
-            case sync: Sync[Any] =>
-              updateLastTrace(sync.trace)
-              var value = sync.eval()
-
-              cur = null
-
-              while ((cur eq null) && stackIndex > minStackIndex) {
-                stackIndex -= 1
-
-                val continuation = _stack(stackIndex)
-
-                popStackFrame(stackIndex)
-
-                continuation match {
-                  case flatMap: ZIO.FlatMap[Any, Any, Any, Any] =>
-                    cur = flatMap.successK(value)
-
-                  case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
-                    cur = foldZIO.successK(value)
-
-                  case map: ZIO.Mapped[Any, Any, Any, Any] =>
-                    value = map.successK(value)
-
-                  case update =>
-                    val updateFlags = update.asInstanceOf[ZIO.UpdateRuntimeFlags]
-                    if (!ignoreFlagsUpdate(updateFlags.update, stackIndex)) {
-                      cur = patchRuntimeFlags(updateFlags.update, null, null)
-                    }
-                }
-              }
-
-              if (cur eq null) {
-                return Exit.succeed(value)
-              }
-
-            case flatmap: FlatMap[Any, Any, Any, Any] =>
-              updateLastTrace(flatmap.trace)
-
-              val first = flatmap.first
-
-              if (first eq ZIO.unit) cur = flatmap.successK(())
-              else {
-                stackIndex = pushStackFrame(flatmap, stackIndex)
-                cur = first
-              }
-
-            case fold: FoldZIO[Any, Any, Any, Any, Any] =>
-              updateLastTrace(fold.trace)
-
-              stackIndex = pushStackFrame(fold, stackIndex)
-              cur = fold.first
-
-            case map: Mapped[Any, Any, Any, Any] =>
-              updateLastTrace(map.trace)
-
-              stackIndex = pushStackFrame(map, stackIndex)
-              cur = map.first
-
-            case stateful: Stateful[Any, Any, Any] =>
-              val trace = stateful.trace
-              updateLastTrace(trace)
-
-              cur = stateful.onState(
-                self.asInstanceOf[FiberRuntime[Any, Any]],
-                Fiber.Status.Running(_runtimeFlags, trace)
-              )
-
-            case async: Async[Any, Any, Any] =>
-              updateLastTrace(async.trace)
-              cur = initiateAsync(async.registerCallback)
-
-              if (cur eq null) {
-                cur = drainQueueAfterAsync()
-              }
-
-              if (cur eq null) {
-                self._blockingOn = async.blockingOn
-                return null
-              }
-
-              self._asyncContWith = AsyncContWith.`null`
-
-              if (shouldInterrupt()) {
-                cur = Exit.failCause(getInterruptedCause())
-              }
-
-            case update0: UpdateRuntimeFlagsWithin.DynamicNoBox[Any, Any, Any] =>
-              val trace = update0.trace
-              updateLastTrace(trace)
-              val updateFlags     = update0.update
-              val oldRuntimeFlags = _runtimeFlags
-              val newRuntimeFlags = RuntimeFlags.patch(updateFlags)(oldRuntimeFlags)
-
-              if (oldRuntimeFlags == newRuntimeFlags) {
-                // No change, short circuit:
-                cur = update0.f(oldRuntimeFlags)
-              } else if (RuntimeFlags.interruptible(newRuntimeFlags) && isInterrupted()) {
-                // One more chance to short circuit: if we're immediately going to interrupt.
-                // Interruption will cause immediate reversion of the flag, so as long as we
-                // "peek ahead", there's no need to set them to begin with.
-                cur = Exit.Failure(getInterruptedCause())
-              } else {
-                // Impossible to short circuit, so record the changes:
-                patchRuntimeFlagsOnly(updateFlags)
-                val revertFlags = RuntimeFlags.diff(newRuntimeFlags, oldRuntimeFlags)
-
-                // Since we updated the flags, we need to revert them:
-                val k = ZIO.UpdateRuntimeFlags(trace, revertFlags)
-
-                stackIndex = pushStackFrame(k, stackIndex)
-                cur = update0.f(oldRuntimeFlags)
-              }
-
-            case iterate: WhileLoop[Any, Any, Any] =>
-              updateLastTrace(iterate.trace)
-
-              val check = iterate.check
-
-              stackIndex = pushStackFrame(iterate.k, stackIndex)
-
-              val nextDepth = currentDepth + 1
-
-              cur = null
-
-              while ((cur eq null) && check()) {
-                runLoop(iterate.body(), stackIndex, stackIndex, nextDepth, ops) match {
-                  case s: Success[Any] =>
-                    iterate.process(s.value)
-                  case null =>
-                    return null
-                  case failure =>
-                    cur = failure
-                }
-                ops += 1
-              }
-
-              stackIndex -= 1
-              popStackFrame(stackIndex)
-
-              if (cur eq null) cur = Exit.unit
-
-            case yieldNow: ZIO.YieldNow =>
-              updateLastTrace(yieldNow.trace)
-              inbox.add(FiberMessage.resumeUnit)
-              return null
-
-            case failure: Exit.Failure[Any] =>
-              var cause = failure.cause
-
-              cur = null
-
-              while ((cur eq null) && stackIndex > minStackIndex) {
-                stackIndex -= 1
-
-                val continuation = _stack(stackIndex)
-
-                popStackFrame(stackIndex)
-
-                continuation match {
-                  case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
-                    if (shouldInterrupt()) {
-                      cause = cause.stripFailures
-                    } else {
-                      cur = foldZIO.failureK(cause)
-                    }
-
-                  case updateFlags: ZIO.UpdateRuntimeFlags if !ignoreFlagsUpdate(updateFlags.update, stackIndex) =>
-                    cause = patchRuntimeFlagsCause(updateFlags.update, cause)
-
-                  case _ => ()
-                }
-              }
-
-              if (cur eq null) {
-                val f =
-                  if (cause eq failure.cause) failure
-                  else Exit.Failure(cause)
-                return f
-              }
-
-            case updateRuntimeFlags: UpdateRuntimeFlags =>
-              updateLastTrace(updateRuntimeFlags.trace)
-              cur = patchRuntimeFlags(updateRuntimeFlags.update, null, Exit.unit)
-
-            case effect =>
-              throw new MatchError(effect)
-          }
+          cur = cur.step(self)
         } catch {
           // TODO: ClosedByInterruptException (but Scala.js??)
           case interruptedException: InterruptedException =>
             updateLastTrace(cur.trace)
             cur = drainQueueWhileRunning(Exit.Failure(Cause.interrupt(FiberId.None) ++ Cause.die(interruptedException)))
+        }
+
+        if (cur eq null) {
+          val result = _loopResult
+          _loopResult = null
+          return result
         }
       }
     }

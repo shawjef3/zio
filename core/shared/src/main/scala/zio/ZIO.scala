@@ -60,6 +60,13 @@ sealed trait ZIO[-R, +E, +A]
   self =>
 
   /**
+   * Evaluates one step of this node on `fiber`, returning the next effect, or
+   * `null` when the run loop should return (see `FiberRuntime.runLoop`).
+   */
+  private[zio] def step(fiber: internal.FiberRuntime[_, _]): ZIO.Erased =
+    throw new MatchError(self)
+
+  /**
    * Returns a new effect that applies the specified aspect to this effect.
    * Aspects are "transformers" that modify the behavior of their input in some
    * well-defined way (for example, adding a timeout).
@@ -6179,14 +6186,20 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
     first: ZIO[R, E, A1],
     successK: A1 => ZIO[R, E, A2]
   ) extends Continuation
-      with ZIO[R, E, A2]
+      with ZIO[R, E, A2] {
+    override private[zio] def step(fiber: internal.FiberRuntime[_, _]): ZIO.Erased =
+      fiber.stepFlatMap(this)
+  }
 
   private[zio] final case class Mapped[R, E, A1, A2](
     trace: Trace,
     first: ZIO[R, E, A1],
     successK: A1 => A2
   ) extends Continuation
-      with ZIO[R, E, A2]
+      with ZIO[R, E, A2] {
+    override private[zio] def step(fiber: internal.FiberRuntime[_, _]): ZIO.Erased =
+      fiber.stepMapped(this)
+  }
 
   private[zio] sealed abstract class Continuation {
     def trace: Trace
@@ -6201,17 +6214,29 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
     successK: A1 => ZIO[R, E2, A2],
     failureK: Cause[E1] => ZIO[R, E2, A2]
   ) extends Continuation
-      with ZIO[R, E2, A2]
-  private[zio] final case class Sync[A](trace: Trace, eval: () => A) extends ZIO[Any, Nothing, A]
+      with ZIO[R, E2, A2] {
+    override private[zio] def step(fiber: internal.FiberRuntime[_, _]): ZIO.Erased =
+      fiber.stepFoldZIO(this)
+  }
+  private[zio] final case class Sync[A](trace: Trace, eval: () => A) extends ZIO[Any, Nothing, A] {
+    override private[zio] def step(fiber: internal.FiberRuntime[_, _]): ZIO.Erased =
+      fiber.stepSync(this)
+  }
   private[zio] final case class Async[R, E, A](
     trace: Trace,
     registerCallback: (ZIO[R, E, A] => Unit) => Either[URIO[R, Any], ZIO[R, E, A]],
     blockingOn: () => FiberId
-  ) extends ZIO[R, E, A]
+  ) extends ZIO[R, E, A] {
+    override private[zio] def step(fiber: internal.FiberRuntime[_, _]): ZIO.Erased =
+      fiber.stepAsync(this)
+  }
 
   private[zio] final case class UpdateRuntimeFlags(trace: Trace, update: RuntimeFlags.Patch)
       extends Continuation
-      with ZIO[Any, Nothing, Unit]
+      with ZIO[Any, Nothing, Unit] {
+    override private[zio] def step(fiber: internal.FiberRuntime[_, _]): ZIO.Erased =
+      fiber.stepUpdateRuntimeFlags(this)
+  }
 
   private[zio] sealed trait UpdateRuntimeFlagsWithin[R, E, A] extends ZIO[R, E, A] {
     def update: RuntimeFlags.Patch
@@ -6243,6 +6268,9 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
     final case class DynamicNoBox[R, E, A](trace: Trace, update: RuntimeFlags.Patch, f: IntFunction[ZIO[R, E, A]])
         extends UpdateRuntimeFlagsWithin[R, E, A] {
       def scope(oldRuntimeFlags: RuntimeFlags): ZIO[R, E, A] = f(oldRuntimeFlags)
+
+      override private[zio] def step(fiber: internal.FiberRuntime[_, _]): ZIO.Erased =
+        fiber.stepDynamicNoBox(this)
     }
   }
   @deprecated("Kept for binary compatibility only", since = "2.1.15")
@@ -6250,7 +6278,10 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
   private[zio] final case class Stateful[R, E, A](
     trace: Trace,
     onState: (Fiber.Runtime[E, A], Fiber.Status.Running) => ZIO[R, E, A]
-  ) extends ZIO[R, E, A]
+  ) extends ZIO[R, E, A] {
+    override private[zio] def step(fiber: internal.FiberRuntime[_, _]): ZIO.Erased =
+      fiber.stepStateful(this)
+  }
   private[zio] final case class WhileLoop[R, E, A](
     trace: Trace,
     check: () => Boolean,
@@ -6258,8 +6289,14 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
     process: A => Any
   ) extends ZIO[R, E, Unit] { self =>
     val k: ZIO.Continuation = ZIO.Continuation { (element: A) => process(element); self }(trace)
+
+    override private[zio] def step(fiber: internal.FiberRuntime[_, _]): ZIO.Erased =
+      fiber.stepWhileLoop(this)
   }
-  private[zio] final case class YieldNow(trace: Trace, forceAsync: Boolean) extends ZIO[Any, Nothing, Unit]
+  private[zio] final case class YieldNow(trace: Trace, forceAsync: Boolean) extends ZIO[Any, Nothing, Unit] {
+    override private[zio] def step(fiber: internal.FiberRuntime[_, _]): ZIO.Erased =
+      fiber.stepYieldNow(this)
+  }
 
   sealed trait InterruptibilityRestorer {
     def apply[R, E, A](effect: => ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, A]
@@ -6789,8 +6826,14 @@ sealed trait Exit[+E, +A] extends ZIO[Any, E, A] { self =>
 
 object Exit extends Serializable {
 
-  final case class Success[+A](value: A)        extends Exit[Nothing, A]
-  final case class Failure[+E](cause: Cause[E]) extends Exit[E, Nothing]
+  final case class Success[+A](value: A) extends Exit[Nothing, A] {
+    override private[zio] def step(fiber: internal.FiberRuntime[_, _]): ZIO.Erased =
+      fiber.stepSuccess(this)
+  }
+  final case class Failure[+E](cause: Cause[E]) extends Exit[E, Nothing] {
+    override private[zio] def step(fiber: internal.FiberRuntime[_, _]): ZIO.Erased =
+      fiber.stepFailure(this)
+  }
 
   def interrupt(id: FiberId): Exit[Nothing, Nothing] =
     failCause(Cause.interrupt(id))
