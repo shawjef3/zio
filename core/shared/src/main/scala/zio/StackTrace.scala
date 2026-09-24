@@ -67,7 +67,7 @@ object StackTrace {
     StackTrace(
       fiberId,
       Chunk
-        .fromArray(stackTrace.takeWhile(_.getClassName != "zio.internal.FiberRuntime"))
+        .fromArray(stackTrace.takeWhile(e => !zio.internal.NodeDispatch.isRunLoopFrame(e.getClassName)))
         .map(Trace.fromJava)
         .takeWhile(!Trace.equalIgnoreLocation(_, trace))
     )

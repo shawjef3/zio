@@ -6179,7 +6179,13 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
     first: ZIO[R, E, A1],
     successK: A1 => ZIO[R, E, A2]
   ) extends Continuation
-      with ZIO[R, E, A2]
+      with ZIO[R, E, A2] {
+    @transient private[zio] val handle: zio.internal.NodeDispatch.Handle1 =
+      zio.internal.NodeDispatch.bind1(successK.asInstanceOf[Any => Any])
+
+    // Method handles are not serializable; rebuild the node so the handle is rebound.
+    private def readResolve(): AnyRef = FlatMap(trace, first, successK)
+  }
 
   private[zio] final case class Mapped[R, E, A1, A2](
     trace: Trace,
@@ -6202,7 +6208,12 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
     failureK: Cause[E1] => ZIO[R, E2, A2]
   ) extends Continuation
       with ZIO[R, E2, A2]
-  private[zio] final case class Sync[A](trace: Trace, eval: () => A) extends ZIO[Any, Nothing, A]
+  private[zio] final case class Sync[A](trace: Trace, eval: () => A) extends ZIO[Any, Nothing, A] {
+    @transient private[zio] val handle: zio.internal.NodeDispatch.Handle0 = zio.internal.NodeDispatch.bind0(eval)
+
+    // Method handles are not serializable; rebuild the node so the handle is rebound.
+    private def readResolve(): AnyRef = Sync(trace, eval)
+  }
   private[zio] final case class Async[R, E, A](
     trace: Trace,
     registerCallback: (ZIO[R, E, A] => Unit) => Either[URIO[R, Any], ZIO[R, E, A]],
