@@ -8,8 +8,11 @@ package zio
  * pass through every shared site: the `Sync` thunk, the `FlatMap`, `FoldZIO`
  * (success and failure) and `Mapped` continuations under both the `Sync` and
  * the `Exit.Success` unwinds, and a `Stateful`. After `run()` each of those
- * sites has seen at least three receivers, so C2 treats it as megamorphic and
- * never inlines an application lambda there, whatever runs later.
+ * sites has recorded three receivers. That is meant to make C2 compile them as
+ * megamorphic virtual calls, but it is a hypothesis, not a guarantee: the
+ * profile keeps counting after setup, so a receiver that dominates later, or a
+ * compile that happens before the profile is complete, can still lead C2 to
+ * inline an application lambda. The benchmark runs check the compiled trees.
  *
  * The programs are written out three times on purpose. Sharing code between
  * them would share lambda classes and defeat the purpose.
