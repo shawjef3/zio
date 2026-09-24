@@ -32,7 +32,7 @@ import java.util.concurrent.TimeUnit
 @Fork(1)
 class RunLoopShapeBenchmark {
 
-  @Param(Array("none", "sameProgram", "forks", "failures", "async", "mixed"))
+  @Param(Array("none", "sameProgram", "forks", "failures", "async", "mixed", "poison"))
   var startupMix: String = _
 
   @Param(Array("1", "2", "3"))
@@ -89,6 +89,8 @@ class RunLoopShapeBenchmark {
     startupMix match {
       case "none" =>
         ()
+      case "poison" =>
+        RunLoopPoison.run()
       case "sameProgram" =>
         repeatFor(budget) { () => run(program1); () }
       case "forks" =>
