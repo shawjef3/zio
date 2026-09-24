@@ -846,8 +846,10 @@ sealed trait ZIO[-R, +E, +A]
       // machinery used up `runLoop`'s inlining budget and hot call sites were left
       // as calls: in `SemaphoreContendedBenchmark` at one permit, about one JVM in
       // six ran 30% slower for its whole life. Forking here keeps the fork out of
-      // that call site entirely, which removed the slow JVMs (0 of 24, against 4
-      // of 24) and also saves a `Sync` node and a closure per fork.
+      // that call site entirely, which removed the slow JVMs on one CPU (0 of 24,
+      // against 4 of 24) and also saves a `Sync` node and a closure per fork. On
+      // another CPU C2 could still pull the fork in through the `Stateful` call
+      // site instead, which is why `runLoop` now handles `Stateful` last.
       //
       // Forking eagerly is safe: the flags and trace are the ones the thunk would
       // have captured, and an interruption landing between this callback and the
