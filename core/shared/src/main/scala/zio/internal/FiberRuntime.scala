@@ -1220,15 +1220,6 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
               stackIndex = pushStackFrame(map, stackIndex)
               cur = map.first
 
-            case stateful: Stateful[Any, Any, Any] =>
-              val trace = stateful.trace
-              updateLastTrace(trace)
-
-              cur = stateful.onState(
-                self.asInstanceOf[FiberRuntime[Any, Any]],
-                Fiber.Status.Running(_runtimeFlags, trace)
-              )
-
             case async: Async[Any, Any, Any] =>
               updateLastTrace(async.trace)
               cur = initiateAsync(async.registerCallback)
@@ -1374,6 +1365,29 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
               } else {
                 cur = ar.onUnavailable()
               }
+
+            // Keep this case last. C2 inlines into this method in the order it
+            // parses it, and stops once the method has taken in its inlining
+            // budget (`DesiredMethodLimit`), so whatever comes late in this match
+            // gets whatever budget is left. `onState` is where forking happens,
+            // and when C2 judges it hot it inlines the whole fork path (the child
+            // fiber's construction, its FiberRefs, its scope). Placed earlier, that
+            // left the cases after it, `Async` and `AcquireReleaseInline` among
+            // them, as plain calls in some JVMs and not others, depending on
+            // compile timing. Last, it can only take budget nobody else needs.
+            // In `SemaphoreContendedBenchmark` at one permit on an Ice Lake host
+            // this halved the JVMs running 10-20% slow (10 of 24 to 5 of 24) and
+            // on a Cascade Lake host narrowed the spread (CV 2.5% to 1.5%). The
+            // cost is a few more type checks before a `Stateful` is recognized,
+            // which did not show in the `FiberRef` and fork benchmarks.
+            case stateful: Stateful[Any, Any, Any] =>
+              val trace = stateful.trace
+              updateLastTrace(trace)
+
+              cur = stateful.onState(
+                self.asInstanceOf[FiberRuntime[Any, Any]],
+                Fiber.Status.Running(_runtimeFlags, trace)
+              )
 
             case effect =>
               throw new MatchError(effect)
