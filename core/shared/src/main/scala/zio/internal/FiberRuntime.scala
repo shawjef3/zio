@@ -1108,9 +1108,29 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
           value = map.successK(value)
 
         case update =>
-          val updateFlags = update.asInstanceOf[ZIO.UpdateRuntimeFlags]
-          if (!ignoreFlagsUpdate(updateFlags.update, stackIndex)) {
-            cur = patchRuntimeFlags(updateFlags.update, null, null)
+          // `ignoreFlagsUpdate` and `patchRuntimeFlags(patch, null, null)`, written out here so that this
+          // helper's bytecode exceeds FreqInlineSize (325) and C2 always compiles it on its own.
+          val patch = update.asInstanceOf[ZIO.UpdateRuntimeFlags].update
+          val ignore =
+            (patch == RuntimeFlags.enableInterruption) && (stackIndex > 0) && (_stack(stackIndex - 1) match {
+              case v: UpdateRuntimeFlags => v.update == RuntimeFlags.disableInterruption
+              case _                     => false
+            })
+          if (!ignore) {
+            val oldFlags = _runtimeFlags
+            val newFlags = RuntimeFlags.patch(patch)(oldFlags)
+            if (oldFlags != newFlags) {
+              if (RuntimeFlags.Patch.isEnabled(patch, RuntimeFlag.CurrentFiber.mask)) {
+                Fiber._currentFiber.set(self)
+              } else if (RuntimeFlags.Patch.isDisabled(patch, RuntimeFlag.CurrentFiber.mask)) {
+                Fiber._currentFiber.set(null)
+              }
+              _runtimeFlags = newFlags
+
+              if (RuntimeFlags.Patch.isEnabled(patch, RuntimeFlag.Interruption.mask) && shouldInterrupt()) {
+                cur = Exit.Failure(getInterruptedCause())
+              }
+            }
           }
       }
     }
