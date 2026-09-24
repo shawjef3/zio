@@ -833,10 +833,13 @@ sealed trait ZIO[-R, +E, +A]
     scopeOverride: FiberScope
   )(implicit trace: Trace): URIO[R, Fiber.Runtime[E, A]] =
     ZIO.withFiberRuntime[R, Nothing, Fiber.Runtime[E, A]] { (parentFiber, parentStatus) =>
-      val f = ZIO.succeed(
-        ZIO.unsafe.fork(trace, self, parentFiber, parentStatus.runtimeFlags, scopeOverride)(Unsafe)
-      )
-      if (parentFiber.shouldYieldBeforeFork()) ZIO.yieldNow *> f else f
+      // Fork here rather than in a `ZIO.succeed` thunk, so ZIO's fork code does not share the `Sync` site in the
+      // run loop with application lambdas. The rare yield path forks in a second `Stateful` after the yield.
+      if (parentFiber.shouldYieldBeforeFork())
+        ZIO.yieldNow *> ZIO.withFiberRuntime[R, Nothing, Fiber.Runtime[E, A]] { (_, _) =>
+          Exit.succeed(ZIO.unsafe.fork(trace, self, parentFiber, parentStatus.runtimeFlags, scopeOverride)(Unsafe))
+        }
+      else Exit.succeed(ZIO.unsafe.fork(trace, self, parentFiber, parentStatus.runtimeFlags, scopeOverride)(Unsafe))
     }
 
   /**

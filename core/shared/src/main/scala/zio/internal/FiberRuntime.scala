@@ -71,8 +71,9 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
 
   @volatile private var _exitValue = null.asInstanceOf[Exit[E, A]]
 
+  // `Stateful` rather than `suspendSucceed`, so the join path does not share the `FlatMap` site with application code.
   def await(implicit trace: Trace): UIO[Exit[E, A]] =
-    ZIO.suspendSucceed(awaitUnsafe)
+    ZIO.withFiberRuntime[Any, Nothing, Exit[E, A]]((_, _) => awaitUnsafe)
 
   @inline
   private[this] def awaitUnsafe(implicit trace: Trace): UIO[Exit[E, A]] = {
@@ -130,7 +131,7 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
     }
 
   override def interruptAs(fiberId: FiberId)(implicit trace: Trace): UIO[Exit[E, A]] =
-    ZIO.suspendSucceed {
+    ZIO.withFiberRuntime[Any, Nothing, Exit[E, A]] { (_, _) =>
       val exit = _exitValue
       if (exit ne null) Exit.succeed(exit)
       else {
