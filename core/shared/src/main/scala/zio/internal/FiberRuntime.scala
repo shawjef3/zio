@@ -1286,6 +1286,8 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
         } catch {
           // TODO: ClosedByInterruptException (but Scala.js??)
           case interruptedException: InterruptedException =>
+            // An unwind helper may have popped frames before throwing; `_stackSize` is authoritative.
+            stackIndex = _stackSize
             updateLastTrace(cur.trace)
             cur = drainQueueWhileRunning(Exit.Failure(Cause.interrupt(FiberId.None) ++ Cause.die(interruptedException)))
         }
