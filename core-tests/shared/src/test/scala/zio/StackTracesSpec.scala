@@ -208,6 +208,7 @@ object StackTracesSpec extends ZIOBaseSpec {
               |	at scala.runtime.java8.JFunction0$mcV$sp.apply
               |	at zio.StackTracesSpec$.assertThrows
               |	at zio.StackTracesSpec$.$anonfun$spec
+              |	at zio.internal.FiberRuntime.runLoopInner
               |	at zio.internal.FiberRuntime.runLoop
               |	at zio.internal.FiberRuntime.evaluateEffect
               |	at zio.internal.FiberRuntime.evaluateMessageWhileSuspended
@@ -245,6 +246,7 @@ object StackTracesSpec extends ZIOBaseSpec {
               |	at zio.StackTracesSpec$.assertThrows
               |	at zio.StackTracesSpec$.spec$$anonfun
               |	at zio.test.TestConstructor$.apply$$anonfun$1$$anonfun
+              |	at zio.internal.FiberRuntime.runLoopInner
               |	at zio.internal.FiberRuntime.runLoop
               |	at zio.internal.FiberRuntime.evaluateEffect
               |	at zio.internal.FiberRuntime.evaluateMessageWhileSuspended

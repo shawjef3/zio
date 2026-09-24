@@ -50,6 +50,11 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
   private var _stackSize      = 0
   private var _isInterrupted  = false
 
+  // Out-parameters of `runLoopInner`: the stack index and op count it stopped at.
+  // A negative `_loopStackIndex` means the inner loop returned the fiber's final `Exit`.
+  private var _loopStackIndex = 0
+  private var _loopOps        = 0
+
   private var _forksSinceYield = 0
 
   private[zio] def shouldYieldBeforeFork(): Boolean =
@@ -1117,9 +1122,12 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
 
         return null
       } else {
+        var inInner = false
         try {
           cur match {
-            case success: Exit.Success[Any] =>
+            case success: Exit.Success[Any]
+                if (stackIndex > minStackIndex) && _stack(stackIndex - 1).isInstanceOf[UpdateRuntimeFlags] =>
+              // Cold unwind: the inner loop hands back a success whose next frame restores runtime flags.
               var value = success.value
 
               cur = null
@@ -1156,63 +1164,22 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
                 }
               }
 
-            case sync: Sync[Any] =>
-              updateLastTrace(sync.trace)
-              var value = sync.eval()
+            case _: Exit.Success[_] | _: Sync[_] | _: FlatMap[_, _, _, _] | _: FoldZIO[_, _, _, _, _] |
+                _: Mapped[_, _, _, _] =>
+              val flags = _runtimeFlags
+              val limit =
+                if (RuntimeFlags.opSupervision(flags)) ops
+                else if (RuntimeFlags.cooperativeYielding(flags))
+                  FiberRuntime.MaxOperationsBeforeYield
+                else Int.MaxValue
 
-              cur = null
+              inInner = true
+              cur = runLoopInner(cur, minStackIndex, stackIndex, ops, limit)
+              inInner = false
 
-              while ((cur eq null) && stackIndex > minStackIndex) {
-                stackIndex -= 1
-
-                val continuation = _stack(stackIndex)
-
-                popStackFrame(stackIndex)
-
-                continuation match {
-                  case flatMap: ZIO.FlatMap[Any, Any, Any, Any] =>
-                    cur = flatMap.successK(value)
-
-                  case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
-                    cur = foldZIO.successK(value)
-
-                  case map: ZIO.Mapped[Any, Any, Any, Any] =>
-                    value = map.successK(value)
-
-                  case update =>
-                    val updateFlags = update.asInstanceOf[ZIO.UpdateRuntimeFlags]
-                    if (!ignoreFlagsUpdate(updateFlags.update, stackIndex)) {
-                      cur = patchRuntimeFlags(updateFlags.update, null, null)
-                    }
-                }
-              }
-
-              if (cur eq null) {
-                return Exit.succeed(value)
-              }
-
-            case flatmap: FlatMap[Any, Any, Any, Any] =>
-              updateLastTrace(flatmap.trace)
-
-              val first = flatmap.first
-
-              if (first eq ZIO.unit) cur = flatmap.successK(())
-              else {
-                stackIndex = pushStackFrame(flatmap, stackIndex)
-                cur = first
-              }
-
-            case fold: FoldZIO[Any, Any, Any, Any, Any] =>
-              updateLastTrace(fold.trace)
-
-              stackIndex = pushStackFrame(fold, stackIndex)
-              cur = fold.first
-
-            case map: Mapped[Any, Any, Any, Any] =>
-              updateLastTrace(map.trace)
-
-              stackIndex = pushStackFrame(map, stackIndex)
-              cur = map.first
+              stackIndex = _loopStackIndex
+              if (stackIndex < 0) return cur.asInstanceOf[Exit[Any, Any]]
+              ops = _loopOps
 
             case stateful: Stateful[Any, Any, Any] =>
               val trace = stateful.trace
@@ -1346,7 +1313,10 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
         } catch {
           // TODO: ClosedByInterruptException (but Scala.js??)
           case interruptedException: InterruptedException =>
-            updateLastTrace(cur.trace)
+            // If the inner loop threw, `cur` is stale (the inner loop already updated the trace) and so is
+            // `stackIndex`; `_stackSize` always tracks the live stack index.
+            if (!inInner) updateLastTrace(cur.trace)
+            stackIndex = _stackSize
             cur = drainQueueWhileRunning(Exit.Failure(Cause.interrupt(FiberId.None) ++ Cause.die(interruptedException)))
         }
       }
@@ -1354,6 +1324,155 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
 
     // unreachable
     assert(DisableAssertions, "runLoop must exit with a return statement from within the while loop.")
+    null
+  }
+
+  /**
+   * The hot part of [[runLoop]]: `Exit.Success`, `Sync`, `FlatMap`, `FoldZIO`
+   * and `Mapped`, with the success unwind through `FlatMap`, `FoldZIO` and
+   * `Mapped` continuations. Kept small so that its C2 compile always has
+   * inlining budget left for its own hot path, whatever the lambda call sites
+   * bring in.
+   *
+   * The first node has already been counted by [[runLoop]]; each further node
+   * increments `ops`, and the loop stops before exceeding `limit`. It returns
+   * to [[runLoop]] on any other node, on an `UpdateRuntimeFlags` continuation
+   * (left on the stack), or when `limit` is reached, storing the stack index
+   * and op count in `_loopStackIndex` and `_loopOps`. When the stack unwinds to
+   * `minStackIndex` it returns the final `Exit` with `_loopStackIndex = -1`.
+   *
+   * Before each further node it checks the inbox and returns if it is not
+   * empty, so [[runLoop]] drains messages (interruption in particular) exactly
+   * as often as before. The supervisor `onEffect` call is not made here:
+   * [[runLoop]] passes `limit = startOps` when op supervision is enabled, which
+   * makes this method run exactly one node per call.
+   */
+  private def runLoopInner(
+    effect: ZIO.Erased,
+    minStackIndex: Int,
+    startStackIndex: Int,
+    startOps: Int,
+    limit: Int
+  ): ZIO.Erased = {
+    // Note that assigning `cur` as the result of `try` or `if` can cause Scalac to box local variables.
+    var cur        = effect
+    var ops        = startOps
+    var stackIndex = startStackIndex
+
+    while (true) {
+      cur match {
+        case success: Exit.Success[Any] =>
+          var value = success.value
+
+          cur = null
+
+          while ((cur eq null) && stackIndex > minStackIndex) {
+            stackIndex -= 1
+
+            val continuation = _stack(stackIndex)
+
+            popStackFrame(stackIndex)
+
+            continuation match {
+              case flatMap: ZIO.FlatMap[Any, Any, Any, Any] =>
+                cur = flatMap.successK(value)
+
+              case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
+                cur = foldZIO.successK(value)
+
+              case map: ZIO.Mapped[Any, Any, Any, Any] =>
+                value = map.successK(value)
+
+              case update =>
+                // UpdateRuntimeFlags: put it back and let runLoop unwind through it.
+                _loopStackIndex = pushStackFrame(update, stackIndex)
+                _loopOps = ops - 1 // runLoop counts the handed-back success again
+                if (success.value.asInstanceOf[AnyRef] eq value.asInstanceOf[AnyRef]) return success
+                else return Exit.succeed(value)
+            }
+          }
+
+          if (cur eq null) {
+            _loopStackIndex = -1
+            if (success.value.asInstanceOf[AnyRef] eq value.asInstanceOf[AnyRef]) return success
+            else return Exit.succeed(value)
+          }
+
+        case sync: Sync[Any] =>
+          updateLastTrace(sync.trace)
+          var value = sync.eval()
+
+          cur = null
+
+          while ((cur eq null) && stackIndex > minStackIndex) {
+            stackIndex -= 1
+
+            val continuation = _stack(stackIndex)
+
+            popStackFrame(stackIndex)
+
+            continuation match {
+              case flatMap: ZIO.FlatMap[Any, Any, Any, Any] =>
+                cur = flatMap.successK(value)
+
+              case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
+                cur = foldZIO.successK(value)
+
+              case map: ZIO.Mapped[Any, Any, Any, Any] =>
+                value = map.successK(value)
+
+              case update =>
+                // UpdateRuntimeFlags: put it back and let runLoop unwind through it.
+                _loopStackIndex = pushStackFrame(update, stackIndex)
+                _loopOps = ops - 1 // runLoop counts the handed-back success again
+                return Exit.succeed(value)
+            }
+          }
+
+          if (cur eq null) {
+            _loopStackIndex = -1
+            return Exit.succeed(value)
+          }
+
+        case flatmap: FlatMap[Any, Any, Any, Any] =>
+          updateLastTrace(flatmap.trace)
+
+          val first = flatmap.first
+
+          if (first eq ZIO.unit) cur = flatmap.successK(())
+          else {
+            stackIndex = pushStackFrame(flatmap, stackIndex)
+            cur = first
+          }
+
+        case fold: FoldZIO[Any, Any, Any, Any, Any] =>
+          updateLastTrace(fold.trace)
+
+          stackIndex = pushStackFrame(fold, stackIndex)
+          cur = fold.first
+
+        case map: Mapped[Any, Any, Any, Any] =>
+          updateLastTrace(map.trace)
+
+          stackIndex = pushStackFrame(map, stackIndex)
+          cur = map.first
+
+        case _ =>
+          _loopStackIndex = stackIndex
+          _loopOps = ops - 1 // already counted below; runLoop counts it again
+          return cur
+      }
+
+      if ((ops >= limit) || !inbox.isEmpty) {
+        _loopStackIndex = stackIndex
+        _loopOps = ops
+        return cur
+      }
+
+      ops += 1
+    }
+
+    // unreachable
     null
   }
 
