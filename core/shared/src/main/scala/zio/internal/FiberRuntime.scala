@@ -54,6 +54,9 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
   private var _coldResult: Exit[Any, Any] = null
   private var _coldOps                    = 0
 
+  // Final value or cause of the last unwind that exhausted the stack; see `unwindSuccess`.
+  private var _unwindResult: AnyRef = null
+
   private var _forksSinceYield = 0
 
   private[zio] def shouldYieldBeforeFork(): Boolean =
@@ -1081,6 +1084,101 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
   }
 
   /**
+   * Pops continuations off the stack, feeding them `value0`, until one of them
+   * produces an effect or the stack reaches `minStackIndex`. Returns the
+   * effect, or `null` if the stack was exhausted, in which case the final value
+   * is left in `_unwindResult`. The new stack index is left in `_stackSize`.
+   */
+  private def unwindSuccess(value0: Any, stackIndex0: Int, minStackIndex: Int): ZIO.Erased = {
+    var value           = value0
+    var stackIndex      = stackIndex0
+    var cur: ZIO.Erased = null
+
+    while ((cur eq null) && stackIndex > minStackIndex) {
+      stackIndex -= 1
+
+      val continuation = _stack(stackIndex)
+
+      popStackFrame(stackIndex)
+
+      continuation match {
+        case flatMap: ZIO.FlatMap[Any, Any, Any, Any] =>
+          cur = flatMap.successK(value)
+
+        case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
+          cur = foldZIO.successK(value)
+
+        case map: ZIO.Mapped[Any, Any, Any, Any] =>
+          value = map.successK(value)
+
+        case update =>
+          // `ignoreFlagsUpdate` and `patchRuntimeFlags(patch, null, null)`, written out here so that this
+          // helper's bytecode exceeds FreqInlineSize (325) and C2 always compiles it on its own.
+          val patch = update.asInstanceOf[ZIO.UpdateRuntimeFlags].update
+          val ignore =
+            (patch == RuntimeFlags.enableInterruption) && (stackIndex > 0) && (_stack(stackIndex - 1) match {
+              case v: UpdateRuntimeFlags => v.update == RuntimeFlags.disableInterruption
+              case _                     => false
+            })
+          if (!ignore) {
+            val oldFlags = _runtimeFlags
+            val newFlags = RuntimeFlags.patch(patch)(oldFlags)
+            if (oldFlags != newFlags) {
+              if (RuntimeFlags.Patch.isEnabled(patch, RuntimeFlag.CurrentFiber.mask)) {
+                Fiber._currentFiber.set(self)
+              } else if (RuntimeFlags.Patch.isDisabled(patch, RuntimeFlag.CurrentFiber.mask)) {
+                Fiber._currentFiber.set(null)
+              }
+              _runtimeFlags = newFlags
+
+              if (RuntimeFlags.Patch.isEnabled(patch, RuntimeFlag.Interruption.mask) && shouldInterrupt()) {
+                cur = Exit.Failure(getInterruptedCause())
+              }
+            }
+          }
+      }
+    }
+
+    if (cur eq null) _unwindResult = value.asInstanceOf[AnyRef]
+    cur
+  }
+
+  /**
+   * Failure counterpart of [[unwindSuccess]]. Leaves the final cause in
+   * `_unwindResult` when the stack is exhausted.
+   */
+  private def unwindFailure(cause0: Cause[Any], stackIndex0: Int, minStackIndex: Int): ZIO.Erased = {
+    var cause           = cause0
+    var stackIndex      = stackIndex0
+    var cur: ZIO.Erased = null
+
+    while ((cur eq null) && stackIndex > minStackIndex) {
+      stackIndex -= 1
+
+      val continuation = _stack(stackIndex)
+
+      popStackFrame(stackIndex)
+
+      continuation match {
+        case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
+          if (shouldInterrupt()) {
+            cause = cause.stripFailures
+          } else {
+            cur = foldZIO.failureK(cause)
+          }
+
+        case updateFlags: ZIO.UpdateRuntimeFlags if !ignoreFlagsUpdate(updateFlags.update, stackIndex) =>
+          cause = patchRuntimeFlagsCause(updateFlags.update, cause)
+
+        case _ => ()
+      }
+    }
+
+    if (cur eq null) _unwindResult = cause
+    cur
+  }
+
+  /**
    * The cold cases of [[runLoop]]: `Stateful`, `Async`, `DynamicNoBox`,
    * `WhileLoop`, `YieldNow`, `Exit.Failure` and `UpdateRuntimeFlags`. Kept out
    * of line, and above C2's `FreqInlineSize` (325 bytes of bytecode, checked by
@@ -1198,33 +1296,12 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
         return null
 
       case failure: Exit.Failure[Any] =>
-        var cause = failure.cause
-
-        cur = null
-
-        while ((cur eq null) && stackIndex > minStackIndex) {
-          stackIndex -= 1
-
-          val continuation = _stack(stackIndex)
-
-          popStackFrame(stackIndex)
-
-          continuation match {
-            case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
-              if (shouldInterrupt()) {
-                cause = cause.stripFailures
-              } else {
-                cur = foldZIO.failureK(cause)
-              }
-
-            case updateFlags: ZIO.UpdateRuntimeFlags if !ignoreFlagsUpdate(updateFlags.update, stackIndex) =>
-              cause = patchRuntimeFlagsCause(updateFlags.update, cause)
-
-            case _ => ()
-          }
-        }
+        cur = unwindFailure(failure.cause, stackIndex, minStackIndex)
+        stackIndex = _stackSize
 
         if (cur eq null) {
+          val cause = _unwindResult.asInstanceOf[Cause[Any]]
+          _unwindResult = null
           _coldResult =
             if (cause eq failure.cause) failure
             else Exit.Failure(cause)
@@ -1286,87 +1363,38 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
         try {
           cur match {
             case success: Exit.Success[Any] =>
-              var value = success.value
-
-              cur = null
-
-              while ((cur eq null) && stackIndex > minStackIndex) {
-                stackIndex -= 1
-
-                val continuation = _stack(stackIndex)
-
-                popStackFrame(stackIndex)
-
-                continuation match {
-                  case flatMap: ZIO.FlatMap[Any, Any, Any, Any] =>
-                    cur = flatMap.successK(value)
-
-                  case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
-                    cur = foldZIO.successK(value)
-
-                  case map: ZIO.Mapped[Any, Any, Any, Any] =>
-                    value = map.successK(value)
-
-                  case update =>
-                    val updateFlags = update.asInstanceOf[ZIO.UpdateRuntimeFlags]
-                    if (!ignoreFlagsUpdate(updateFlags.update, stackIndex)) {
-                      cur = patchRuntimeFlags(updateFlags.update, null, null)
-                    }
-                }
-              }
+              cur = unwindSuccess(success.value, stackIndex, minStackIndex)
+              stackIndex = _stackSize
 
               if (cur eq null) {
+                val value = _unwindResult
+                _unwindResult = null
                 return {
-                  if (success.value.asInstanceOf[AnyRef] eq value.asInstanceOf[AnyRef]) success
+                  if (success.value.asInstanceOf[AnyRef] eq value) success
                   else Exit.succeed(value)
                 }
               }
 
             case sync: Sync[Any] =>
               updateLastTrace(sync.trace)
-              var value = sync.eval()
-
-              cur = null
-
-              while ((cur eq null) && stackIndex > minStackIndex) {
-                stackIndex -= 1
-
-                val continuation = _stack(stackIndex)
-
-                popStackFrame(stackIndex)
-
-                continuation match {
-                  case flatMap: ZIO.FlatMap[Any, Any, Any, Any] =>
-                    cur = flatMap.successK(value)
-
-                  case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
-                    cur = foldZIO.successK(value)
-
-                  case map: ZIO.Mapped[Any, Any, Any, Any] =>
-                    value = map.successK(value)
-
-                  case update =>
-                    val updateFlags = update.asInstanceOf[ZIO.UpdateRuntimeFlags]
-                    if (!ignoreFlagsUpdate(updateFlags.update, stackIndex)) {
-                      cur = patchRuntimeFlags(updateFlags.update, null, null)
-                    }
-                }
-              }
+              cur = unwindSuccess(sync.eval(), stackIndex, minStackIndex)
+              stackIndex = _stackSize
 
               if (cur eq null) {
+                val value = _unwindResult
+                _unwindResult = null
                 return Exit.succeed(value)
               }
 
             case flatmap: FlatMap[Any, Any, Any, Any] =>
               updateLastTrace(flatmap.trace)
 
+              // Always push, even when `first` is `ZIO.unit`: continuing with `Exit.unit` makes the next
+              // iteration unwind into `successK`, so continuations are only invoked from `unwindSuccess`.
               val first = flatmap.first
-
-              if (first eq ZIO.unit) cur = flatmap.successK(())
-              else {
-                stackIndex = pushStackFrame(flatmap, stackIndex)
-                cur = first
-              }
+              stackIndex = pushStackFrame(flatmap, stackIndex)
+              if (first eq ZIO.unit) cur = Exit.unit
+              else cur = first
 
             case fold: FoldZIO[Any, Any, Any, Any, Any] =>
               updateLastTrace(fold.trace)
