@@ -266,10 +266,70 @@ jobs:
       - name: Test on different Scala target platforms
         run: free --si -tmws 10 & sbt -v test${{ matrix.platform }}
 
+  testRunLoopForm:
+    # zio/zio#11251: run the core tests under the form of FiberRuntime.runLoopInner that this
+    # x86 runner would not select by default: the form that invokes user code via helper
+    # methods, which is the aarch64 default. ZIO_RUNLOOP_USER_CODE_VIA_HELPERS is read by
+    # runLoopFormTestSettings in build.sbt and forwarded to the forked test JVMs as
+    # -Dzio.runLoop.userCodeViaHelpers; RunLoopFlagsSpec fails if it does not arrive.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: ${{ ((github.event_name != 'repository_dispatch') && (github.event.action != 'update-docs')) }}
+    env:
+      ZIO_RUNLOOP_USER_CODE_VIA_HELPERS: 'true'
+    steps:
+      - name: Checkout current branch
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.ref }}
+      - name: Setup Java
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: 17
+          check-latest: true
+      - name: Setup sbt
+        uses: sbt/setup-sbt@v1
+      - name: Cache scala dependencies
+        uses: coursier/cache-action@v8
+      - name: Core tests with the run loop invoking user code via helpers
+        run: sbt -v coreTestsJVM/test
+
+  testArm:
+    # zio/zio#11251: on aarch64 the run loop defaults to invoking user code via helper
+    # methods. This checks the default resolves that way, that the bytecode-size invariant
+    # behind the split holds on both Scala versions, and that stack traces carry the form's
+    # extra frame. The form's
+    # semantics are covered in full by testRunLoopForm on x86.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    if: ${{ ((github.event_name != 'repository_dispatch') && (github.event.action != 'update-docs')) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        scala: ['2.13.x', '3.x']
+    steps:
+      - name: Checkout current branch
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || github.ref }}
+      - name: Setup Java
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: 17
+          check-latest: true
+      - name: Setup sbt
+        uses: sbt/setup-sbt@v1
+      - name: Cache scala dependencies
+        uses: coursier/cache-action@v8
+      - name: Run loop specs on aarch64
+        run: sbt -v ++${{ matrix.scala }} "coreTestsJVM/testOnly zio.internal.RunLoopFlagsSpec zio.internal.FiberRuntimeHelperSizeSpec zio.StackTracesSpec"
+
   ci:
     if: always()
     runs-on: ubuntu-latest
-    needs: [lint, publishLocal, build-website, test, testJvms, testPlatforms]
+    needs: [lint, publishLocal, build-website, test, testJvms, testPlatforms, testRunLoopForm, testArm]
     steps:
       - uses: re-actors/alls-green@release/v1
         with:

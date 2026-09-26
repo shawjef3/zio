@@ -268,7 +268,7 @@ lazy val coreTests = crossProject(JSPlatform, JVMPlatform, NativePlatform)
     Compile / classLoaderLayeringStrategy := ClassLoaderLayeringStrategy.Flat
   )
   .jvmConfigure(_.enablePlugins(JCStressPlugin))
-  .jvmSettings(replSettings)
+  .jvmSettings(replSettings, runLoopFormTestSettings)
   .jsSettings(
     jsSettings,
     scalacOptions ++= {
@@ -280,6 +280,18 @@ lazy val coreTests = crossProject(JSPlatform, JVMPlatform, NativePlatform)
     }
   )
   .nativeSettings(nativeSettings)
+
+// zio/zio#11251: `FiberRuntime.runLoopInner` has two forms selected once per JVM by the
+// `zio.runLoop.userCodeViaHelpers` system property (default: on for aarch64, off elsewhere).
+// CI runs the core tests under the non-default form by setting
+// ZIO_RUNLOOP_USER_CODE_VIA_HELPERS to `true` or `false`, which this forwards to the forked
+// test JVMs.
+lazy val runLoopFormTestSettings = Seq(
+  Test / javaOptions ++= sys.env
+    .get("ZIO_RUNLOOP_USER_CODE_VIA_HELPERS")
+    .map(v => s"-Dzio.runLoop.userCodeViaHelpers=$v")
+    .toSeq
+)
 
 lazy val managed = crossProject(JSPlatform, JVMPlatform, NativePlatform)
   .in(file("managed"))
