@@ -189,81 +189,94 @@ object StackTracesSpec extends ZIOBaseSpec {
             .getOrThrow()
         }
 
+        // `evalSyncInner` is on the stack only when the run loop invokes user code via helpers
+        // (the default on aarch64; see zio.internal.RunLoopFlags). The expected traces below
+        // include its frame; drop it when the mode is off.
+        def withRunLoopMode(trace: String): String =
+          if (zio.internal.RunLoopFlags.USER_CODE_VIA_HELPERS) trace
+          else trace.replace("\tat zio.internal.FiberRuntime.evalSyncInner\n", "")
+
         assertThrows(call())(exceptionHasTrace {
-          if (TestVersion.isScala2)
-            """java.lang.RuntimeException: boom
-              |	at zio.StackTracesSpec$.$anonfun$spec
-              |	at zio.ZIO$.$anonfun$die
-              |	at zio.ZIO$.$anonfun$failCause
-              |	at zio.internal.FiberRuntime.runLoop
-              |	at zio.internal.FiberRuntime.evaluateEffect
-              |	at zio.internal.FiberRuntime.start
-              |	at zio.Runtime$UnsafeAPIV1.runOrFork
-              |	at zio.Runtime$UnsafeAPIV1.run
-              |	at zio.StackTracesSpec$.$anonfun$spec
-              |	at zio.Unsafe$.unsafe
-              |	at zio.StackTracesSpec$.subcall
-              |	at zio.StackTracesSpec$.call
-              |	at zio.StackTracesSpec$.$anonfun$spec
-              |	at scala.runtime.java8.JFunction0$mcV$sp.apply
-              |	at zio.StackTracesSpec$.assertThrows
-              |	at zio.StackTracesSpec$.$anonfun$spec
-              |	at zio.internal.FiberRuntime.runLoop
-              |	at zio.internal.FiberRuntime.evaluateEffect
-              |	at zio.internal.FiberRuntime.evaluateMessageWhileSuspended
-              |	at zio.internal.FiberRuntime.drainQueueOnCurrentThread
-              |	at zio.internal.FiberRuntime.run
-              |	at zio.internal.ZScheduler$$anon$3.run
-              |	Suppressed: zio.Cause$FiberTrace: java.lang.RuntimeException: boom
-              |	at zio.StackTracesSpec.spec.subcall2
-              |	at zio.StackTracesSpec.spec.subcall
-              |	at zio.StackTracesSpec$.$anonfun$spec
-              |	at zio.Unsafe$.unsafe
-              |	at zio.StackTracesSpec$.subcall
-              |	at zio.StackTracesSpec$.call
-              |	at zio.StackTracesSpec$.$anonfun$spec
-              |	at scala.runtime.java8.JFunction0$mcV$sp.apply
-              |	at zio.StackTracesSpec$.assertThrows
-              |	at zio.StackTracesSpec$.$anonfun$spec
-              |""".stripMargin
-          else
-            """java.lang.RuntimeException: boom
-              |	at zio.StackTracesSpec$.subcall2$2$$anonfun
-              |	at zio.ZIO$.die$$anonfun
-              |	at zio.ZIO$.failCause$$anonfun
-              |	at zio.internal.FiberRuntime.runLoop
-              |	at zio.internal.FiberRuntime.evaluateEffect
-              |	at zio.internal.FiberRuntime.start
-              |	at zio.Runtime$UnsafeAPIV1.runOrFork
-              |	at zio.Runtime$UnsafeAPIV1.run
-              |	at zio.StackTracesSpec$.subcall$2$$anonfun
-              |	at zio.Unsafe$.unsafe
-              |	at zio.StackTracesSpec$.subcall
-              |	at zio.StackTracesSpec$.call
-              |	at zio.StackTracesSpec$.spec$$anonfun$7$$anonfun
-              |	at zio.StackTracesSpec$.spec$$anonfun$7$$anonfun$adapted
-              |	at zio.StackTracesSpec$.assertThrows
-              |	at zio.StackTracesSpec$.spec$$anonfun
-              |	at zio.test.TestConstructor$.apply$$anonfun$1$$anonfun
-              |	at zio.internal.FiberRuntime.runLoop
-              |	at zio.internal.FiberRuntime.evaluateEffect
-              |	at zio.internal.FiberRuntime.evaluateMessageWhileSuspended
-              |	at zio.internal.FiberRuntime.drainQueueOnCurrentThread
-              |	at zio.internal.FiberRuntime.run
-              |	at zio.internal.ZScheduler$$anon$3.run
-              |	Suppressed: zio.Cause$FiberTrace: java.lang.RuntimeException: boom
-              |	at zio.StackTracesSpec.spec.subcall2
-              |	at zio.StackTracesSpec.spec.subcall
-              |	at zio.StackTracesSpec$.subcall$2$$anonfun
-              |	at zio.Unsafe$.unsafe
-              |	at zio.StackTracesSpec$.subcall
-              |	at zio.StackTracesSpec$.call
-              |	at zio.StackTracesSpec$.spec$$anonfun$7$$anonfun
-              |	at zio.StackTracesSpec$.spec$$anonfun$7$$anonfun$adapted
-              |	at zio.StackTracesSpec$.assertThrows
-              |	at zio.StackTracesSpec$.spec$$anonfun
-              |	at zio.test.TestConstructor$.apply$$anonfun$1$$anonfun
-              |""".stripMargin
+          withRunLoopMode(
+            if (TestVersion.isScala2)
+              """java.lang.RuntimeException: boom
+                |	at zio.StackTracesSpec$.$anonfun$spec
+                |	at zio.ZIO$.$anonfun$die
+                |	at zio.ZIO$.$anonfun$failCause
+                |	at zio.internal.FiberRuntime.runLoop
+                |	at zio.internal.FiberRuntime.evaluateEffect
+                |	at zio.internal.FiberRuntime.start
+                |	at zio.Runtime$UnsafeAPIV1.runOrFork
+                |	at zio.Runtime$UnsafeAPIV1.run
+                |	at zio.StackTracesSpec$.$anonfun$spec
+                |	at zio.Unsafe$.unsafe
+                |	at zio.StackTracesSpec$.subcall
+                |	at zio.StackTracesSpec$.call
+                |	at zio.StackTracesSpec$.$anonfun$spec
+                |	at scala.runtime.java8.JFunction0$mcV$sp.apply
+                |	at zio.StackTracesSpec$.assertThrows
+                |	at zio.StackTracesSpec$.$anonfun$spec
+                |	at zio.internal.FiberRuntime.evalSyncInner
+                |	at zio.internal.FiberRuntime.runLoopInner
+                |	at zio.internal.FiberRuntime.runLoop
+                |	at zio.internal.FiberRuntime.evaluateEffect
+                |	at zio.internal.FiberRuntime.evaluateMessageWhileSuspended
+                |	at zio.internal.FiberRuntime.drainQueueOnCurrentThread
+                |	at zio.internal.FiberRuntime.run
+                |	at zio.internal.ZScheduler$$anon$3.run
+                |	Suppressed: zio.Cause$FiberTrace: java.lang.RuntimeException: boom
+                |	at zio.StackTracesSpec.spec.subcall2
+                |	at zio.StackTracesSpec.spec.subcall
+                |	at zio.StackTracesSpec$.$anonfun$spec
+                |	at zio.Unsafe$.unsafe
+                |	at zio.StackTracesSpec$.subcall
+                |	at zio.StackTracesSpec$.call
+                |	at zio.StackTracesSpec$.$anonfun$spec
+                |	at scala.runtime.java8.JFunction0$mcV$sp.apply
+                |	at zio.StackTracesSpec$.assertThrows
+                |	at zio.StackTracesSpec$.$anonfun$spec
+                |""".stripMargin
+            else
+              """java.lang.RuntimeException: boom
+                |	at zio.StackTracesSpec$.subcall2$2$$anonfun
+                |	at zio.ZIO$.die$$anonfun
+                |	at zio.ZIO$.failCause$$anonfun
+                |	at zio.internal.FiberRuntime.runLoop
+                |	at zio.internal.FiberRuntime.evaluateEffect
+                |	at zio.internal.FiberRuntime.start
+                |	at zio.Runtime$UnsafeAPIV1.runOrFork
+                |	at zio.Runtime$UnsafeAPIV1.run
+                |	at zio.StackTracesSpec$.subcall$2$$anonfun
+                |	at zio.Unsafe$.unsafe
+                |	at zio.StackTracesSpec$.subcall
+                |	at zio.StackTracesSpec$.call
+                |	at zio.StackTracesSpec$.spec$$anonfun$7$$anonfun
+                |	at zio.StackTracesSpec$.spec$$anonfun$7$$anonfun$adapted
+                |	at zio.StackTracesSpec$.assertThrows
+                |	at zio.StackTracesSpec$.spec$$anonfun
+                |	at zio.test.TestConstructor$.apply$$anonfun$1$$anonfun
+                |	at zio.internal.FiberRuntime.evalSyncInner
+                |	at zio.internal.FiberRuntime.runLoopInner
+                |	at zio.internal.FiberRuntime.runLoop
+                |	at zio.internal.FiberRuntime.evaluateEffect
+                |	at zio.internal.FiberRuntime.evaluateMessageWhileSuspended
+                |	at zio.internal.FiberRuntime.drainQueueOnCurrentThread
+                |	at zio.internal.FiberRuntime.run
+                |	at zio.internal.ZScheduler$$anon$3.run
+                |	Suppressed: zio.Cause$FiberTrace: java.lang.RuntimeException: boom
+                |	at zio.StackTracesSpec.spec.subcall2
+                |	at zio.StackTracesSpec.spec.subcall
+                |	at zio.StackTracesSpec$.subcall$2$$anonfun
+                |	at zio.Unsafe$.unsafe
+                |	at zio.StackTracesSpec$.subcall
+                |	at zio.StackTracesSpec$.call
+                |	at zio.StackTracesSpec$.spec$$anonfun$7$$anonfun
+                |	at zio.StackTracesSpec$.spec$$anonfun$7$$anonfun$adapted
+                |	at zio.StackTracesSpec$.assertThrows
+                |	at zio.StackTracesSpec$.spec$$anonfun
+                |	at zio.test.TestConstructor$.apply$$anonfun$1$$anonfun
+                |""".stripMargin
+          )
         })
       }
     ) @@ jvmOnly
