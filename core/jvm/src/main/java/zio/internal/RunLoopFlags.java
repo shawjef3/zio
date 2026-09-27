@@ -51,6 +51,36 @@ public final class RunLoopFlags {
    */
   public static final boolean USER_CODE_VIA_HELPERS = computeUserCodeViaHelpers();
 
+  /** System property that overrides {@link #SYNC_SLOTS}: "true" or "false". */
+  public static final String SYNC_SLOTS_PROPERTY = "zio.runLoop.syncSlots";
+
+  /**
+   * Whether the run loop dispatches each {@code Sync} thunk and each
+   * {@code FlatMap} continuation through a call site chosen by the lambda's
+   * class (see {@link SyncSlots}), so that C2 sees a monomorphic site per
+   * lambda class and inlines it regardless of what else ran at startup. On x86
+   * that inline is worth about 20 percent on tight loops; on Arm cores it is
+   * the slow shape, so the default is on except for aarch64. It only applies
+   * to the direct form ({@link #USER_CODE_VIA_HELPERS} off), whose call sites
+   * are the ones in the loop.
+   */
+  public static final boolean SYNC_SLOTS = computeSyncSlots();
+
+  private static boolean computeSyncSlots() {
+    try {
+      String prop = System.getProperty(SYNC_SLOTS_PROPERTY);
+      if (prop != null) {
+        String v = prop.trim();
+        if (v.equalsIgnoreCase("true")) return true;
+        if (v.equalsIgnoreCase("false")) return false;
+      }
+      String arch = System.getProperty("os.arch", "");
+      return !(arch.equals("aarch64") || arch.equals("arm64"));
+    } catch (Throwable t) {
+      return false;
+    }
+  }
+
   private static boolean computeUserCodeViaHelpers() {
     try {
       String prop = System.getProperty(USER_CODE_VIA_HELPERS_PROPERTY);

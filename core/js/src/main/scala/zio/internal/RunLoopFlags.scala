@@ -23,4 +23,6 @@ package zio.internal
 private[zio] object RunLoopFlags {
   final val USER_CODE_VIA_HELPERS_PROPERTY = "zio.runLoop.userCodeViaHelpers"
   final val USER_CODE_VIA_HELPERS          = false
+  final val SYNC_SLOTS_PROPERTY            = "zio.runLoop.syncSlots"
+  final val SYNC_SLOTS                     = false
 }

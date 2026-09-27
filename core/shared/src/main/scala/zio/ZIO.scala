@@ -6179,7 +6179,10 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
     first: ZIO[R, E, A1],
     successK: A1 => ZIO[R, E, A2]
   ) extends Continuation
-      with ZIO[R, E, A2]
+      with ZIO[R, E, A2] {
+    // Which call site in runLoop invokes `successK` (zio/zio#11251); see SyncSlots.
+    val slots: internal.SyncSlots.Entry = internal.SyncSlots.entryOf(successK.getClass)
+  }
 
   private[zio] final case class Mapped[R, E, A1, A2](
     trace: Trace,
@@ -6202,7 +6205,10 @@ object ZIO extends ZIOCompanionPlatformSpecific with ZIOCompanionVersionSpecific
     failureK: Cause[E1] => ZIO[R, E2, A2]
   ) extends Continuation
       with ZIO[R, E2, A2]
-  private[zio] final case class Sync[A](trace: Trace, eval: () => A) extends ZIO[Any, Nothing, A]
+  private[zio] final case class Sync[A](trace: Trace, eval: () => A) extends ZIO[Any, Nothing, A] {
+    // Which call site in runLoop invokes `eval` (zio/zio#11251); see SyncSlots.
+    val slots: internal.SyncSlots.Entry = internal.SyncSlots.entryOf(eval.getClass)
+  }
   private[zio] final case class Async[R, E, A](
     trace: Trace,
     registerCallback: (ZIO[R, E, A] => Unit) => Either[URIO[R, Any], ZIO[R, E, A]],

@@ -1,5 +1,5 @@
 /*
- * Copyright 2017-2024 John A. De Goes and the ZIO Contributors
+ * Copyright 2018-2024 John A. De Goes and the ZIO Contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,13 +16,17 @@
 
 package zio.internal
 
-/**
- * Counterpart of the JVM `RunLoopFlags` Java class. The switch it carries only
- * matters to HotSpot's C2 compiler, so on Scala Native the direct path is used.
- */
-private[zio] object RunLoopFlags {
-  final val USER_CODE_VIA_HELPERS_PROPERTY = "zio.runLoop.userCodeViaHelpers"
-  final val USER_CODE_VIA_HELPERS          = false
-  final val SYNC_SLOTS_PROPERTY            = "zio.runLoop.syncSlots"
-  final val SYNC_SLOTS                     = false
+/** Counterpart of the JVM `SyncSlots`; every class shares the overflow entry. */
+private[zio] object SyncSlots {
+  final val SLOTS         = 16
+  final val OVERFLOW      = SLOTS
+  final val PROMOTE_AFTER = 1L << 14
+
+  final class Entry(val slot: Int) {
+    var count: Long = 0L
+  }
+
+  private[this] val overflowEntry     = new Entry(OVERFLOW)
+  def entryOf(c: Class[_]): Entry     = overflowEntry
+  def promote(e: Entry): Unit         = ()
 }
