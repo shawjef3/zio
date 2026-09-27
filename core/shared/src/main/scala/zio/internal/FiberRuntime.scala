@@ -1165,7 +1165,7 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
               }
 
             case _: Exit.Success[_] | _: Sync[_] | _: FlatMap[_, _, _, _] | _: FoldZIO[_, _, _, _, _] |
-                _: Mapped[_, _, _, _] =>
+                _: Mapped[_, _, _, _] | _: Stateful[_, _, _] =>
               val flags = _runtimeFlags
               val limit =
                 if (RuntimeFlags.opSupervision(flags)) ops
@@ -1495,6 +1495,23 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
           stackIndex = pushStackFrame(map, stackIndex)
           cur = map.first
 
+        case stateful: Stateful[Any, Any, Any] =>
+          // Experiment (zio/zio#11251 follow-up): handle Stateful here instead of bouncing to
+          // runLoop. `onState` is a lambda, so the helper form routes it through the same helper
+          // as `Sync.eval`.
+          if (RunLoopFlags.USER_CODE_VIA_HELPERS) {
+            cur = evalSyncInner(stateful, stackIndex, minStackIndex)
+            if (_unwindReturn) return cur
+            stackIndex = _unwindStackIndex
+          } else {
+            val trace = stateful.trace
+            updateLastTrace(trace)
+            cur = stateful.onState(
+              self.asInstanceOf[FiberRuntime[Any, Any]],
+              Fiber.Status.Running(_runtimeFlags, trace)
+            )
+          }
+
         case _ =>
           _loopStackIndex = stackIndex
           _loopOps = ops - 1 // already counted below; runLoop counts it again
@@ -1601,7 +1618,18 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
    * stays above `FreqInlineSize` and `sync.eval()` never lands in
    * `runLoopInner`.
    */
-  private def evalSyncInner(sync: ZIO.Sync[Any], stackIndex0: Int, minStackIndex: Int): ZIO.Erased = {
+  private def evalSyncInner(effect: ZIO.Erased, stackIndex0: Int, minStackIndex: Int): ZIO.Erased = {
+    // Experiment: `Stateful` shares this helper so its `onState` lambda is also invoked out of
+    // `runLoopInner`; it returns the next effect directly with the stack untouched.
+    if (effect.isInstanceOf[Stateful[_, _, _]]) {
+      val stateful = effect.asInstanceOf[Stateful[Any, Any, Any]]
+      val trace    = stateful.trace
+      if ((trace ne null) && (trace ne emptyTrace) && (_lastTrace ne trace)) _lastTrace = trace
+      _unwindReturn = false
+      _unwindStackIndex = stackIndex0
+      return stateful.onState(self.asInstanceOf[FiberRuntime[Any, Any]], Fiber.Status.Running(_runtimeFlags, trace))
+    }
+    val sync = effect.asInstanceOf[ZIO.Sync[Any]]
     // `updateLastTrace`, by hand
     val trace = sync.trace
     if ((trace ne null) && (trace ne emptyTrace) && (_lastTrace ne trace)) _lastTrace = trace
