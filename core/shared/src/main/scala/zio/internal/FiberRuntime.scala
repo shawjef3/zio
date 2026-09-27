@@ -25,7 +25,7 @@ import zio.stacktracer.TracingImplicits.disableAutoTrace
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.{Set => JavaSet}
-import scala.annotation.tailrec
+import scala.annotation.{switch, tailrec}
 
 final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, runtimeFlags0: RuntimeFlags)
     extends Fiber.Runtime.Internal[E, A]
@@ -1133,7 +1133,32 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
 
                 continuation match {
                   case flatMap: ZIO.FlatMap[Any, Any, Any, Any] =>
-                    cur = flatMap.successK(value)
+                    if (RunLoopFlags.SYNC_SLOTS) {
+                      val e = flatMap.slots
+                      (e.slot: @switch) match {
+                        case 0  => cur = flatMap.successK(value)
+                        case 1  => cur = flatMap.successK(value)
+                        case 2  => cur = flatMap.successK(value)
+                        case 3  => cur = flatMap.successK(value)
+                        case 4  => cur = flatMap.successK(value)
+                        case 5  => cur = flatMap.successK(value)
+                        case 6  => cur = flatMap.successK(value)
+                        case 7  => cur = flatMap.successK(value)
+                        case 8  => cur = flatMap.successK(value)
+                        case 9  => cur = flatMap.successK(value)
+                        case 10 => cur = flatMap.successK(value)
+                        case 11 => cur = flatMap.successK(value)
+                        case 12 => cur = flatMap.successK(value)
+                        case 13 => cur = flatMap.successK(value)
+                        case 14 => cur = flatMap.successK(value)
+                        case 15 => cur = flatMap.successK(value)
+                        case _ =>
+                          cur = flatMap.successK(value)
+                          val n = e.count + 1
+                          e.count = n
+                          if (n == SyncSlots.PROMOTE_AFTER) SyncSlots.promote(e)
+                      }
+                    } else cur = flatMap.successK(value)
 
                   case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
                     cur = foldZIO.successK(value)
@@ -1158,7 +1183,35 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
 
             case sync: Sync[Any] =>
               updateLastTrace(sync.trace)
-              var value = sync.eval()
+              // One call site per lambda class so C2 inlines each one deterministically
+              // (zio/zio#11251); see SyncSlots. C2 folds the flag.
+              var value: Any = null
+              if (RunLoopFlags.SYNC_SLOTS) {
+                val e = sync.slots
+                (e.slot: @switch) match {
+                  case 0  => value = sync.eval()
+                  case 1  => value = sync.eval()
+                  case 2  => value = sync.eval()
+                  case 3  => value = sync.eval()
+                  case 4  => value = sync.eval()
+                  case 5  => value = sync.eval()
+                  case 6  => value = sync.eval()
+                  case 7  => value = sync.eval()
+                  case 8  => value = sync.eval()
+                  case 9  => value = sync.eval()
+                  case 10 => value = sync.eval()
+                  case 11 => value = sync.eval()
+                  case 12 => value = sync.eval()
+                  case 13 => value = sync.eval()
+                  case 14 => value = sync.eval()
+                  case 15 => value = sync.eval()
+                  case _ =>
+                    value = sync.eval()
+                    val n = e.count + 1
+                    e.count = n
+                    if (n == SyncSlots.PROMOTE_AFTER) SyncSlots.promote(e)
+                }
+              } else value = sync.eval()
 
               cur = null
 
@@ -1171,7 +1224,32 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
 
                 continuation match {
                   case flatMap: ZIO.FlatMap[Any, Any, Any, Any] =>
-                    cur = flatMap.successK(value)
+                    if (RunLoopFlags.SYNC_SLOTS) {
+                      val e = flatMap.slots
+                      (e.slot: @switch) match {
+                        case 0  => cur = flatMap.successK(value)
+                        case 1  => cur = flatMap.successK(value)
+                        case 2  => cur = flatMap.successK(value)
+                        case 3  => cur = flatMap.successK(value)
+                        case 4  => cur = flatMap.successK(value)
+                        case 5  => cur = flatMap.successK(value)
+                        case 6  => cur = flatMap.successK(value)
+                        case 7  => cur = flatMap.successK(value)
+                        case 8  => cur = flatMap.successK(value)
+                        case 9  => cur = flatMap.successK(value)
+                        case 10 => cur = flatMap.successK(value)
+                        case 11 => cur = flatMap.successK(value)
+                        case 12 => cur = flatMap.successK(value)
+                        case 13 => cur = flatMap.successK(value)
+                        case 14 => cur = flatMap.successK(value)
+                        case 15 => cur = flatMap.successK(value)
+                        case _ =>
+                          cur = flatMap.successK(value)
+                          val n = e.count + 1
+                          e.count = n
+                          if (n == SyncSlots.PROMOTE_AFTER) SyncSlots.promote(e)
+                      }
+                    } else cur = flatMap.successK(value)
 
                   case foldZIO: ZIO.FoldZIO[Any, Any, Any, Any, Any] =>
                     cur = foldZIO.successK(value)
@@ -1196,8 +1274,34 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
 
               val first = flatmap.first
 
-              if (first eq ZIO.unit) cur = flatmap.successK(())
-              else {
+              if (first eq ZIO.unit) {
+                if (RunLoopFlags.SYNC_SLOTS) {
+                  val e = flatmap.slots
+                  (e.slot: @switch) match {
+                    case 0  => cur = flatmap.successK(())
+                    case 1  => cur = flatmap.successK(())
+                    case 2  => cur = flatmap.successK(())
+                    case 3  => cur = flatmap.successK(())
+                    case 4  => cur = flatmap.successK(())
+                    case 5  => cur = flatmap.successK(())
+                    case 6  => cur = flatmap.successK(())
+                    case 7  => cur = flatmap.successK(())
+                    case 8  => cur = flatmap.successK(())
+                    case 9  => cur = flatmap.successK(())
+                    case 10 => cur = flatmap.successK(())
+                    case 11 => cur = flatmap.successK(())
+                    case 12 => cur = flatmap.successK(())
+                    case 13 => cur = flatmap.successK(())
+                    case 14 => cur = flatmap.successK(())
+                    case 15 => cur = flatmap.successK(())
+                    case _ =>
+                      cur = flatmap.successK(())
+                      val n = e.count + 1
+                      e.count = n
+                      if (n == SyncSlots.PROMOTE_AFTER) SyncSlots.promote(e)
+                  }
+                } else cur = flatmap.successK(())
+              } else {
                 stackIndex = pushStackFrame(flatmap, stackIndex)
                 cur = first
               }
