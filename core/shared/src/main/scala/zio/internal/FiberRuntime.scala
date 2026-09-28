@@ -2954,7 +2954,10 @@ object FiberRuntime {
     if (LoopCopies.COPIES == 1) return 0
     var cur   = node
     var steps = 0
-    while ((cur ne null) && steps < 16) {
+    var i1    = -1
+    var i2    = -1
+    var i3    = -1
+    while ((cur ne null) && steps < 16 && i3 < 0) {
       steps += 1
       var lambda: AnyRef = null
       cur match {
@@ -2967,9 +2970,14 @@ object FiberRuntime {
         case s: ZIO.Stateful[_, _, _]                                 => lambda = s.onState; cur = null
         case _                                                        => cur = null
       }
-      if ((lambda ne null) && !LoopCopies.isInternal(lambda.getClass)) return LoopCopies.copyOf(lambda.getClass)
+      if ((lambda ne null) && !LoopCopies.isInternal(lambda.getClass)) {
+        val idx = LoopCopies.copyOf(lambda.getClass)
+        if (i1 < 0) i1 = idx else if (i2 < 0) i2 = idx else i3 = idx
+      }
     }
-    0
+    // Copy 0 is reserved for fibers that run only ZIO-internal lambdas, so their profiles
+    // never share rows with an application program.
+    if (i1 < 0) 0 else LoopCopies.copyFor(i1, i2, i3)
   }
   private val emptyTrace = Trace.empty
 

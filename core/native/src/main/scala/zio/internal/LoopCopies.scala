@@ -20,4 +20,5 @@ private[zio] object LoopCopies {
   final val COPIES                      = 1
   def isInternal(c: Class[_]): Boolean  = true
   def copyOf(c: Class[_]): Int          = 0
+  def copyFor(i1: Int, i2: Int, i3: Int): Int = 0
 }

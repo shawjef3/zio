@@ -36,9 +36,16 @@ public final class LoopCopies {
   private static final ClassValue<Integer> COPY = new ClassValue<Integer>() {
     @Override
     protected Integer computeValue(Class<?> c) {
-      return next.getAndIncrement() % COPIES;
+      return next.getAndIncrement();
     }
   };
+
+  /** Combines the registration indexes of up to three signature classes into a copy in 1..COPIES-1; copy 0 is for fibers with no application lambda. */
+  public static int copyFor(int i1, int i2, int i3) {
+    int h = i1 * 1000003 + i2 * 31 + i3;
+    if (i2 < 0) h = i1;
+    return 1 + Math.floorMod(h, COPIES - 1);
+  }
 
   /** True for lambdas belonging to ZIO's own machinery rather than the application. */
   public static boolean isInternal(Class<?> c) {
