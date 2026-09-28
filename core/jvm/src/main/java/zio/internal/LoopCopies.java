@@ -40,11 +40,20 @@ public final class LoopCopies {
     }
   };
 
-  /** Combines the registration indexes of up to three signature classes into a copy in 1..COPIES-1; copy 0 is for fibers with no application lambda. */
+  private static final java.util.concurrent.ConcurrentHashMap<Long, Integer> SIGNATURES =
+      new java.util.concurrent.ConcurrentHashMap<>();
+  private static final AtomicInteger nextCopy = new AtomicInteger(0);
+
+  /**
+   * Maps a signature (the registration indexes of up to three application lambda classes, -1
+   * when absent) to a copy in 1..COPIES-1, first come first served, wrapping when all are
+   * taken. Copy 0 is for fibers with no application lambda.
+   */
   public static int copyFor(int i1, int i2, int i3) {
-    int h = i1 * 1000003 + i2 * 31 + i3;
-    if (i2 < 0) h = i1;
-    return 1 + Math.floorMod(h, COPIES - 1);
+    long key = ((long) (i1 & 0x1FFFFF) << 42) | ((long) (i2 & 0x1FFFFF) << 21) | (long) (i3 & 0x1FFFFF);
+    Integer c = SIGNATURES.get(key);
+    if (c != null) return c;
+    return SIGNATURES.computeIfAbsent(key, k -> 1 + nextCopy.getAndIncrement() % (COPIES - 1));
   }
 
   /** True for lambdas belonging to ZIO's own machinery rather than the application. */
