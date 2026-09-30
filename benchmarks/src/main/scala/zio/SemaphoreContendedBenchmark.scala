@@ -45,13 +45,13 @@ import java.util.concurrent.atomic.LongAdder
  *     settle; two measurement iterations are enough after that.
  *   - JIT inlining in the run loop. This benchmark's body and the runtime's own
  *     code share call sites in `FiberRuntime.runLoop`, and in a program this
- *     small C2 inlines at them depending on compile timing. Forks used to run
- *     through one such site, and about one JVM in six settled 30% low at one
- *     permit until `ZIO.forkWithScopeOverride` was changed to fork outside it.
- *     If forks start splitting into a fast and a slow group again, suspect the
- *     same kind of inlining race before anything in the semaphore, and look at
- *     the fraction of slow forks, not only the mean. Do not hide it with JVM
- *     flags such as `-XX:-TieredCompilation`, which measure a configuration
+ *     small C2 inlines at them depending on compile timing. The fork thunk runs
+ *     through one such site, and about one JVM in six settles 30% low at one
+ *     permit when C2 inlines the fork path there and runs out of budget for the
+ *     rest of the loop. If forks split into a fast and a slow group, suspect
+ *     that inlining race before anything in the semaphore, and look at the
+ *     fraction of slow forks, not only the mean. Do not hide it with JVM flags
+ *     such as `-XX:-TieredCompilation`, which measure a configuration
  *     production does not run.
  *
  * Use at least 12 forks, one parameter point per run:

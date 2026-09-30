@@ -211,9 +211,20 @@ object Semaphore {
     ): ZIO[Any, Nothing, Unit] = {
       val waiter = state.enqueue(n)
       restore {
-        ZIO.async[Any, Nothing, Unit](
-          cb => if (!waiter.register(cb)) cb(Exit.unit),
-          FiberId.None
+        // `register` fails when the permits were handed to this waiter in the
+        // window between `enqueue` and here, which a releasing thread on
+        // another core does often under contention. The permits are then
+        // already ours, so resume in place: returning the result from the
+        // registration lets the run loop carry on without suspending. Invoking
+        // the callback instead, as `ZIO.async` would, offers this fiber to the
+        // scheduler, wakes a worker and suspends, only to be picked up again:
+        // a scheduling round trip and a wake-up syscall to continue a fiber
+        // that is already running on this thread. Profiled at ten fibers over
+        // one permit, that round trip was the largest single cost.
+        ZIO.Async[Any, Nothing, Unit](
+          trace,
+          cb => if (waiter.register(cb)) null else AlreadyGranted,
+          NoBlockingFiber
         )
       }.onInterrupt(ZIO.succeed(state.cancel(waiter)))
     }
@@ -221,4 +232,14 @@ object Semaphore {
     private def die(n: Long)(implicit trace: Trace): UIO[Nothing] =
       ZIO.die(new IllegalArgumentException(s"Unexpected negative `$n` permits requested."))
   }
+
+  /**
+   * What `enqueueAndAwait`'s registration returns when the waiter was granted
+   * before its callback could be installed: continue synchronously with `()`.
+   * Shared, since it carries no state and the path is taken often.
+   */
+  private val AlreadyGranted: Either[URIO[Any, Any], ZIO[Any, Nothing, Unit]] = Right(Exit.unit)
+
+  /** No fiber is responsible for completing a semaphore's waiters. */
+  private val NoBlockingFiber: () => FiberId = () => FiberId.None
 }
