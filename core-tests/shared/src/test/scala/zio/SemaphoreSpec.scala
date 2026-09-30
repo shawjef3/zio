@@ -88,6 +88,30 @@ object SemaphoreSpec extends ZIOBaseSpec {
         waitingEnd   <- semaphore.awaiting.repeatUntil(_ == 0)
       } yield assertTrue(waitingStart == 10, waitingEnd == 0)
     } @@ timeout(10.seconds),
+    test("withPermit provides mutual exclusion under contention") {
+      val active    = new java.util.concurrent.atomic.AtomicInteger(0)
+      val violation = new java.util.concurrent.atomic.AtomicInteger(0)
+      val body = ZIO.succeed {
+        if (active.incrementAndGet() > 1) violation.incrementAndGet()
+        active.decrementAndGet()
+      }
+      for {
+        sem <- Semaphore.make(1L)
+        _   <- ZIO.foreachParDiscard(1 to 10)(_ => sem.withPermit(body).repeatN(999))
+      } yield assertTrue(violation.get == 0)
+    } @@ timeout(30.seconds),
+    test("withPermits never over-allocates permits under contention") {
+      val active    = new java.util.concurrent.atomic.AtomicInteger(0)
+      val violation = new java.util.concurrent.atomic.AtomicInteger(0)
+      def body(n: Int) = ZIO.succeed {
+        if (active.addAndGet(n) > 5) violation.incrementAndGet()
+        active.addAndGet(-n)
+      }
+      for {
+        sem <- Semaphore.make(5L)
+        _   <- ZIO.foreachParDiscard(1 to 10)(i => sem.withPermits((i % 5 + 1).toLong)(body(i % 5 + 1)).repeatN(499))
+      } yield assertTrue(violation.get == 0)
+    } @@ timeout(30.seconds),
     test("withPermits waits for all requested permits and releases them") {
       for {
         sem      <- Semaphore.make(2L)
