@@ -19,7 +19,6 @@ package zio
 import zio.stacktracer.TracingImplicits.disableAutoTrace
 import zio.stm.TSemaphore
 
-import java.util.function.IntFunction
 import scala.annotation.tailrec
 
 /**
@@ -115,132 +114,6 @@ object Semaphore {
     var granted: Boolean                          = false
   }
 
-  /**
-   * The effect returned by `withPermits`, in the shape `uninterruptible(
-   * acquire; fold(restore(zio), release))`. It is the mask's own body, so each
-   * execution starts by creating its [[Acquisition]] once the fiber is
-   * uninterruptible.
-   */
-  private final class WithPermits[R, E, A](sem: Impl, n: Long, zio: ZIO[R, E, A], trace: Trace)
-      extends IntFunction[ZIO[R, E, A]] {
-    def toZIO: ZIO[R, E, A] =
-      ZIO.UpdateRuntimeFlagsWithin(trace, RuntimeFlags.disableInterruption, this)
-
-    def apply(oldFlags: Int): ZIO[R, E, A] =
-      new Acquisition(sem, n, zio, trace).start(oldFlags)
-  }
-
-  /**
-   * The state of one execution of `withPermits`. This one object is every
-   * function of that execution, telling the calls apart by `phase`: the body of
-   * the restored region, the continuation after a queued fiber is granted, and
-   * the fold's success branch. Permits are taken only once the fiber is
-   * uninterruptible and are released from the fold, which the runtime reaches
-   * for every exit of `zio` because the fold sits inside the mask.
-   */
-  private final class Acquisition[R, E, A](sem: Impl, n: Long, zio: ZIO[R, E, A], trace: Trace)
-      extends IntFunction[ZIO[R, E, A]]
-      with (Any => ZIO[R, E, A]) {
-    private[this] var phase: Int     = Acquisition.Start
-    private[this] var waiter: Waiter = null
-
-    def start(oldFlags: Int): ZIO[R, E, A] = {
-      waiter = sem.reserve(n)
-      phase = if (waiter eq null) Acquisition.Holding else Acquisition.Waiting
-      val restored =
-        if (RuntimeFlags.interruption(oldFlags))
-          ZIO.UpdateRuntimeFlagsWithin(trace, RuntimeFlags.enableInterruption, this)
-        else body()
-      ZIO.FoldZIO[R, E, E, A, A](trace, restored, this, new Acquisition.Failed(this))
-    }
-
-    /** The body of the restored region. */
-    def apply(oldFlags: Int): ZIO[R, E, A] = body()
-
-    private def body(): ZIO[R, E, A] =
-      if (waiter eq null) zio else ZIO.FlatMap(trace, sem.await(waiter)(trace), this)
-
-    /** The continuation after a grant, then the fold's success branch. */
-    def apply(value: Any): ZIO[R, E, A] =
-      if (phase == Acquisition.Waiting) {
-        phase = Acquisition.Holding
-        zio
-      } else {
-        sem.release(n)
-        Exit.succeed(value.asInstanceOf[A])
-      }
-
-    def failed(cause: Cause[E]): Exit[E, Nothing] = {
-      if (phase == Acquisition.Waiting) sem.cancelOrRelease(waiter) else sem.release(n)
-      Exit.failCause(cause)
-    }
-  }
-
-  private object Acquisition {
-    final val Start   = 0
-    final val Waiting = 1
-    final val Holding = 2
-
-    final class Failed[R, E, A](acquisition: Acquisition[R, E, A]) extends (Cause[E] => ZIO[R, E, A]) {
-      def apply(cause: Cause[E]): ZIO[R, E, A] = acquisition.failed(cause)
-    }
-  }
-
-  /**
-   * The effect returned by `tryWithPermits`, shaped like [[WithPermits]] but
-   * never queuing.
-   */
-  private final class TryWithPermits[R, E, A](sem: Impl, n: Long, zio: ZIO[R, E, A], trace: Trace)
-      extends IntFunction[ZIO[R, E, Any]] {
-    def toZIO: ZIO[R, E, Option[A]] =
-      ZIO
-        .UpdateRuntimeFlagsWithin[R, E, Any](trace, RuntimeFlags.disableInterruption, this)
-        .asInstanceOf[ZIO[R, E, Option[A]]]
-
-    def apply(oldFlags: Int): ZIO[R, E, Any] =
-      if (sem.tryAcquire(n)) new TryAcquisition(sem, n, zio, trace).start(oldFlags)
-      else Exit.none
-  }
-
-  /** The state of one execution of `tryWithPermits` that took its permits. */
-  private final class TryAcquisition[R, E, A](sem: Impl, n: Long, zio: ZIO[R, E, A], trace: Trace)
-      extends IntFunction[ZIO[R, E, Any]]
-      with (Any => ZIO[R, E, Any]) {
-
-    def start(oldFlags: Int): ZIO[R, E, Any] = {
-      val restored: ZIO[R, E, Any] =
-        if (RuntimeFlags.interruption(oldFlags))
-          ZIO.UpdateRuntimeFlagsWithin[R, E, Any](trace, RuntimeFlags.enableInterruption, this)
-        else zio
-      ZIO.FoldZIO[R, E, E, Any, Option[A]](
-        trace,
-        restored,
-        this.asInstanceOf[Any => ZIO[R, E, Option[A]]],
-        new TryAcquisition.Failed(this)
-      )
-    }
-
-    /** The body of the restored region. */
-    def apply(oldFlags: Int): ZIO[R, E, Any] = zio
-
-    /** The fold's success branch. */
-    def apply(value: Any): ZIO[R, E, Any] = {
-      sem.release(n)
-      Exit.succeed(Some(value.asInstanceOf[A]))
-    }
-
-    def failed(cause: Cause[E]): Exit[E, Nothing] = {
-      sem.release(n)
-      Exit.failCause(cause)
-    }
-  }
-
-  private object TryAcquisition {
-    final class Failed[R, E, A](acquisition: TryAcquisition[R, E, A]) extends (Cause[E] => ZIO[R, E, Option[A]]) {
-      def apply(cause: Cause[E]): ZIO[R, E, Option[A]] = acquisition.failed(cause)
-    }
-  }
-
   private final class Impl(initial: Long) extends Semaphore {
 
     /**
@@ -277,7 +150,20 @@ object Semaphore {
     def withPermits[R, E, A](n: Long)(zio: ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, A] =
       if (n < 0L) negative(n)
       else if (n == 0L) zio
-      else new WithPermits(this, n, zio, trace).toZIO
+      else
+        ZIO.uninterruptibleMask { restore =>
+          val waiter = reserve(n)
+          if (waiter eq null)
+            restore(zio).foldCauseZIO(
+              cause => { release(n); Exit.failCause(cause) },
+              a => { release(n); Exit.succeed(a) }
+            )
+          else
+            restore(await(waiter).flatMap(_ => zio)).foldCauseZIO(
+              cause => { cancelOrRelease(waiter); Exit.failCause(cause) },
+              a => { release(n); Exit.succeed(a) }
+            )
+        }
 
     def withPermitsScoped(n: Long)(implicit trace: Trace): ZIO[Scope, Nothing, Unit] =
       if (n < 0L) negative(n)
@@ -292,7 +178,15 @@ object Semaphore {
     override def tryWithPermits[R, E, A](n: Long)(zio: ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, Option[A]] =
       if (n < 0L) negative(n)
       else if (n == 0L) zio.asSome
-      else new TryWithPermits(this, n, zio, trace).toZIO
+      else
+        ZIO.uninterruptibleMask { restore =>
+          if (tryAcquire(n))
+            restore(zio).foldCauseZIO(
+              cause => { release(n); Exit.failCause(cause) },
+              a => { release(n); Exit.succeed(Some(a)) }
+            )
+          else Exit.none
+        }
 
     private def negative(n: Long)(implicit trace: Trace): UIO[Nothing] =
       ZIO.die(new IllegalArgumentException(s"Unexpected negative `$n` permits requested."))
@@ -301,7 +195,7 @@ object Semaphore {
      * Takes `n` permits if they are available and nobody is queued ahead.
      */
     @tailrec
-    def tryAcquire(n: Long): Boolean = {
+    private def tryAcquire(n: Long): Boolean = {
       val current = permits.get
       if (hasWaiters || current < n) false
       else if (permits.compareAndSet(current, current - n)) true
@@ -311,7 +205,7 @@ object Semaphore {
     /**
      * Takes `n` permits now, returning null, or queues a waiter for them.
      */
-    def reserve(n: Long): Waiter =
+    private def reserve(n: Long): Waiter =
       if (tryAcquire(n)) null
       else
         synchronized {
@@ -341,7 +235,7 @@ object Semaphore {
      * interrupted first, the grant may still arrive and is then dropped by the
      * runtime, so the waiter's owner must call `cancelOrRelease` afterwards.
      */
-    def await(waiter: Waiter)(implicit trace: Trace): UIO[Unit] =
+    private def await(waiter: Waiter)(implicit trace: Trace): UIO[Unit] =
       ZIO.Async[Any, Nothing, Unit](
         trace,
         callback => {
@@ -364,7 +258,7 @@ object Semaphore {
      * Returns `n` permits and wakes as many queued fibers as they satisfy, in
      * FIFO order.
      */
-    def release(n: Long): Unit = {
+    private def release(n: Long): Unit = {
       permits.addAndGet(n)
       if (hasWaiters) drain()
     }
@@ -373,7 +267,7 @@ object Semaphore {
      * Removes a waiter that was never granted, or returns its permits if it
      * was.
      */
-    def cancelOrRelease(waiter: Waiter): Unit = {
+    private def cancelOrRelease(waiter: Waiter): Unit = {
       val granted = synchronized {
         if (waiter.granted) true
         else {
