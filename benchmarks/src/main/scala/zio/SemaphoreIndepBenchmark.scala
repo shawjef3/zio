@@ -47,7 +47,7 @@ class SemaphoreIndepBenchmark {
   @Benchmark
   def baselineNoSemaphore(bh: Blackhole): Unit =
     unsafeRun(for {
-      fiber <- ZIO.forkAll(List.fill(fibers)(repeat(ops)(Exit.succeed(bh.consume(1)))))
+      fiber <- ZIO.forkAll(List.fill(fibers)(repeat(ops)(ZIO.succeed(bh.consume(1)))))
       _     <- fiber.join
     } yield ())
 }
