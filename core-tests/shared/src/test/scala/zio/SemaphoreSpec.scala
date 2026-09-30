@@ -87,6 +87,99 @@ object SemaphoreSpec extends ZIOBaseSpec {
         _            <- promise.succeed(())
         waitingEnd   <- semaphore.awaiting.repeatUntil(_ == 0)
       } yield assertTrue(waitingStart == 10, waitingEnd == 0)
+    } @@ timeout(10.seconds),
+    test("withPermits waits for all requested permits and releases them") {
+      for {
+        sem      <- Semaphore.make(2L)
+        gate     <- Promise.make[Nothing, Unit]
+        holder   <- sem.withPermits(2L)(gate.await).fork
+        _        <- sem.available.repeatUntil(_ == 0L)
+        waiter   <- sem.withPermits(2L)(ZIO.unit).fork
+        _        <- sem.awaiting.repeatUntil(_ == 1L)
+        before   <- sem.available
+        _        <- gate.succeed(())
+        _        <- holder.join
+        _        <- waiter.join
+        after    <- sem.available
+        awaiting <- sem.awaiting
+      } yield assertTrue(before == 0L, after == 2L, awaiting == 0L)
+    } @@ timeout(10.seconds),
+    test("waiting fibers are granted permits in FIFO order") {
+      for {
+        sem    <- Semaphore.make(1L)
+        gate   <- Promise.make[Nothing, Unit]
+        order  <- Ref.make(List.empty[Int])
+        holder <- sem.withPermit(gate.await).fork
+        _      <- sem.available.repeatUntil(_ == 0L)
+        fibers <- ZIO.foreach(1 to 5) { i =>
+                    sem.withPermit(order.update(i :: _)).fork <* sem.awaiting.repeatUntil(_ == i.toLong)
+                  }
+        _      <- gate.succeed(())
+        _      <- holder.join
+        _      <- ZIO.foreachDiscard(fibers)(_.join)
+        result <- order.get
+      } yield assertTrue(result.reverse == List(1, 2, 3, 4, 5))
+    } @@ timeout(10.seconds),
+    test("interrupting a waiting fiber removes it from the queue without losing permits") {
+      for {
+        sem      <- Semaphore.make(1L)
+        gate     <- Promise.make[Nothing, Unit]
+        holder   <- sem.withPermit(gate.await).fork
+        _        <- sem.available.repeatUntil(_ == 0L)
+        waiter   <- sem.withPermit(ZIO.unit).fork
+        _        <- sem.awaiting.repeatUntil(_ == 1L)
+        _        <- waiter.interrupt
+        awaiting <- sem.awaiting
+        _        <- gate.succeed(())
+        _        <- holder.join
+        after    <- sem.available
+      } yield assertTrue(awaiting == 0L, after == 1L)
+    } @@ timeout(10.seconds),
+    test("interrupting the head waiter lets later waiters proceed") {
+      for {
+        sem    <- Semaphore.make(2L)
+        gate   <- Promise.make[Nothing, Unit]
+        holder <- sem.withPermits(2L)(gate.await).fork
+        _      <- sem.available.repeatUntil(_ == 0L)
+        big    <- sem.withPermits(2L)(ZIO.unit).fork
+        _      <- sem.awaiting.repeatUntil(_ == 1L)
+        small  <- sem.withPermit(ZIO.unit).fork
+        _      <- sem.awaiting.repeatUntil(_ == 2L)
+        _      <- big.interrupt
+        _      <- gate.succeed(())
+        _      <- holder.join
+        _      <- small.join
+        after  <- sem.available
+      } yield assertTrue(after == 2L)
+    } @@ timeout(10.seconds),
+    test("withPermitScoped is interruptible while waiting and does not leak permits") {
+      for {
+        sem    <- Semaphore.make(1L)
+        gate   <- Promise.make[Nothing, Unit]
+        holder <- sem.withPermit(gate.await).fork
+        _      <- sem.available.repeatUntil(_ == 0L)
+        waiter <- ZIO.scoped(sem.withPermitScoped *> ZIO.never).fork
+        _      <- sem.awaiting.repeatUntil(_ == 1L)
+        _      <- waiter.interrupt
+        _      <- gate.succeed(())
+        _      <- holder.join
+        after  <- sem.available
+      } yield assertTrue(after == 1L)
+    } @@ timeout(10.seconds),
+    test("tryWithPermits does not jump ahead of waiting fibers") {
+      for {
+        sem    <- Semaphore.make(3L)
+        gate   <- Promise.make[Nothing, Unit]
+        holder <- sem.withPermits(2L)(gate.await).fork
+        _      <- sem.available.repeatUntil(_ == 1L)
+        waiter <- sem.withPermits(2L)(ZIO.unit).fork
+        _      <- sem.awaiting.repeatUntil(_ == 1L)
+        tried  <- sem.tryWithPermit(ZIO.unit)
+        _      <- gate.succeed(())
+        _      <- holder.join
+        _      <- waiter.join
+        after  <- sem.available
+      } yield assertTrue(tried.isEmpty, after == 3L)
     } @@ timeout(10.seconds)
   ) @@ exceptJS(nonFlaky)
 }
