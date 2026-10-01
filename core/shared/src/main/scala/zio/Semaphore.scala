@@ -17,6 +17,7 @@
 package zio
 
 import zio.stacktracer.TracingImplicits.disableAutoTrace
+import zio.internal.SemaphorePermits
 import zio.stm.TSemaphore
 
 import scala.annotation.tailrec
@@ -138,13 +139,11 @@ object Semaphore {
    * `withPermits` family built on `reserve`, `await`, `release` and
    * `cancelOrRelease`.
    */
-  private sealed abstract class Base(initial: Long) extends Semaphore {
+  private sealed abstract class Base(initial: Long) extends SemaphorePermits(initial) with Semaphore {
 
-    /**
-     * Permits not held by anyone. Taken on the fast path with a single CAS and
-     * returned with a single atomic add.
-     */
-    protected final val permits = new java.util.concurrent.atomic.AtomicLong(initial)
+    // The free-permit counter is the padded field inherited from
+    // SemaphorePermits: taken on the fast path with a single CAS and returned
+    // with a single atomic add.
 
     /**
      * True whenever `waiters` may be non-empty. Written under the lock, read
@@ -234,9 +233,9 @@ object Semaphore {
     /** Takes `n` permits if available, ignoring any waiters. */
     @tailrec
     protected final def takePermits(n: Long): Boolean = {
-      val current = permits.get
+      val current = permitsGet()
       if (current < n) false
-      else if (permits.compareAndSet(current, current - n)) true
+      else if (permitsCompareAndSet(current, current - n)) true
       else takePermits(n)
     }
 
@@ -271,16 +270,16 @@ object Semaphore {
   private final class Fair(initial: Long) extends Base(initial) {
 
     def available(implicit trace: Trace): UIO[Long] =
-      ZIO.succeed(if (hasWaiters) 0L else permits.get)
+      ZIO.succeed(if (hasWaiters) 0L else permitsGet())
 
     override def awaiting(implicit trace: Trace): UIO[Long] =
       ZIO.succeed(if (hasWaiters) waiters.synchronized(waiters.size.toLong) else 0L)
 
     @tailrec
     protected def tryAcquire(n: Long): Boolean = {
-      val current = permits.get
+      val current = permitsGet()
       if (hasWaiters || current < n) false
-      else if (permits.compareAndSet(current, current - n)) true
+      else if (permitsCompareAndSet(current, current - n)) true
       else tryAcquire(n)
     }
 
@@ -305,7 +304,7 @@ object Semaphore {
       suspend(waiter)
 
     protected def release(n: Long): Unit = {
-      permits.addAndGet(n)
+      permitsAddAndGet(n)
       if (hasWaiters) drain()
     }
 
@@ -361,7 +360,7 @@ object Semaphore {
     private[this] var retrying: Waiter = null
 
     def available(implicit trace: Trace): UIO[Long] =
-      ZIO.succeed(permits.get)
+      ZIO.succeed(permitsGet())
 
     override def awaiting(implicit trace: Trace): UIO[Long] =
       ZIO.succeed(waiters.synchronized(waiters.size.toLong + (if (retrying eq null) 0L else 1L)))
@@ -409,7 +408,7 @@ object Semaphore {
       }
 
     protected def release(n: Long): Unit = {
-      permits.addAndGet(n)
+      permitsAddAndGet(n)
       if (hasWaiters) wakeHead()
     }
 
