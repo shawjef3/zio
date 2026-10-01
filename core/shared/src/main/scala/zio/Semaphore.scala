@@ -121,10 +121,10 @@ object Semaphore {
 
   /**
    * A fiber waiting for `n` permits. All fields are guarded by the owning
-   * semaphore's lock. `woken` is set when the semaphore hands the waiter its
-   * resumption, either because it was granted its permits (fair) or because it
-   * should retry for them (unfair); `holding` is set once the waiter owns its
-   * permits.
+   * semaphore's waiter-queue lock. `woken` is set when the semaphore hands the
+   * waiter its resumption, either because it was granted its permits (fair) or
+   * because it should retry for them (unfair); `holding` is set once the waiter
+   * owns its permits.
    */
   private final class Waiter(val n: Long) {
     var callback: ZIO[Any, Nothing, Unit] => Unit = null
@@ -154,7 +154,11 @@ object Semaphore {
      */
     @volatile protected final var hasWaiters: Boolean = false
 
-    /** Guarded by `this`. */
+    /**
+     * The waiter queue, which is also the lock for every field the policy
+     * classes mark as guarded. Locking the deque rather than the semaphore
+     * keeps monitor traffic off the cache line that holds `hasWaiters`.
+     */
     protected final val waiters = new java.util.ArrayDeque[Waiter]
 
     /** Takes `n` permits now if the implementation's policy allows. */
@@ -245,7 +249,7 @@ object Semaphore {
       ZIO.Async[Any, Nothing, Unit](
         trace,
         callback => {
-          val done = synchronized {
+          val done = waiters.synchronized {
             if (waiter.woken) true
             else {
               waiter.callback = callback
@@ -270,7 +274,7 @@ object Semaphore {
       ZIO.succeed(if (hasWaiters) 0L else permits.get)
 
     override def awaiting(implicit trace: Trace): UIO[Long] =
-      ZIO.succeed(if (hasWaiters) synchronized(waiters.size.toLong) else 0L)
+      ZIO.succeed(if (hasWaiters) waiters.synchronized(waiters.size.toLong) else 0L)
 
     @tailrec
     protected def tryAcquire(n: Long): Boolean = {
@@ -283,7 +287,7 @@ object Semaphore {
     protected def reserve(n: Long): Waiter =
       if (tryAcquire(n)) null
       else
-        synchronized {
+        waiters.synchronized {
           // Publish the flag before re-reading the permits (see `hasWaiters`).
           hasWaiters = true
           if (waiters.isEmpty && takePermits(n)) {
@@ -306,7 +310,7 @@ object Semaphore {
     }
 
     protected def cancelOrRelease(waiter: Waiter): Unit = {
-      val holding = synchronized {
+      val holding = waiters.synchronized {
         if (waiter.holding) true
         else {
           waiters.remove(waiter)
@@ -324,7 +328,7 @@ object Semaphore {
       var granted = false
       // The callback is read under the lock: a waiter that registers after this
       // sees `woken` and resumes itself instead.
-      val callback = synchronized {
+      val callback = waiters.synchronized {
         val head = waiters.peekFirst
         if ((head ne null) && takePermits(head.n)) {
           waiters.pollFirst()
@@ -351,20 +355,22 @@ object Semaphore {
    */
   private final class Unfair(initial: Long) extends Base(initial) {
 
-    /** Guarded by `this`: a waiter has been woken and has not yet retried. */
+    /**
+     * Guarded by `waiters`: a waiter has been woken and has not yet retried.
+     */
     private[this] var retrying: Waiter = null
 
     def available(implicit trace: Trace): UIO[Long] =
       ZIO.succeed(permits.get)
 
     override def awaiting(implicit trace: Trace): UIO[Long] =
-      ZIO.succeed(synchronized(waiters.size.toLong + (if (retrying eq null) 0L else 1L)))
+      ZIO.succeed(waiters.synchronized(waiters.size.toLong + (if (retrying eq null) 0L else 1L)))
 
     protected def tryAcquire(n: Long): Boolean = takePermits(n)
 
     protected def reserve(n: Long): Waiter =
       if (takePermits(n)) null
-      else synchronized(enqueue(new Waiter(n), atFront = false))
+      else waiters.synchronized(enqueue(new Waiter(n), atFront = false))
 
     /**
      * Queues the waiter unless the permits arrived meanwhile. The caller holds
@@ -389,7 +395,7 @@ object Semaphore {
      */
     protected def await(waiter: Waiter)(implicit trace: Trace): UIO[Unit] =
       suspend(waiter).flatMap { _ =>
-        val acquired = synchronized {
+        val acquired = waiters.synchronized {
           retrying = null
           waiter.woken = false
           if (takePermits(waiter.n)) {
@@ -408,7 +414,7 @@ object Semaphore {
     }
 
     protected def cancelOrRelease(waiter: Waiter): Unit = {
-      val holding = synchronized {
+      val holding = waiters.synchronized {
         if (waiter.holding) true
         else {
           if (retrying eq waiter) retrying = null
@@ -423,7 +429,7 @@ object Semaphore {
 
     /** Wakes the head waiter to retry unless one is already retrying. */
     private def wakeHead(): Unit = {
-      val callback = synchronized {
+      val callback = waiters.synchronized {
         if (retrying ne null) null
         else {
           val head = waiters.pollFirst()
