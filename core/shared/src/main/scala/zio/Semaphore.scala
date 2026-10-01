@@ -90,64 +90,98 @@ sealed trait Semaphore extends Serializable {
 object Semaphore {
 
   /**
-   * Creates a new `Semaphore` with the specified number of permits.
+   * Creates a new `Semaphore` with the specified number of permits. Fibers
+   * waiting for permits are served in FIFO order.
    */
   def make(permits: => Long)(implicit trace: Trace): UIO[Semaphore] =
     ZIO.succeed(unsafe.make(permits)(Unsafe))
 
+  /**
+   * Creates a new unfair `Semaphore` with the specified number of permits.
+   *
+   * Permits go to whichever fiber asks first, even if other fibers are already
+   * waiting, so a fiber that releases and immediately re-acquires usually keeps
+   * its permits without suspending. This gives higher throughput under
+   * contention than [[make]] at the cost of ordering: a waiting fiber may be
+   * overtaken indefinitely.
+   */
+  def makeUnfair(permits: => Long)(implicit trace: Trace): UIO[Semaphore] =
+    ZIO.succeed(unsafe.makeUnfair(permits)(Unsafe))
+
   object unsafe {
     def make(permits: Long)(implicit unsafe: Unsafe): Semaphore =
-      new Impl(permits)
+      new Fair(permits)
+
+    def makeUnfair(permits: Long)(implicit unsafe: Unsafe): Semaphore =
+      new Unfair(permits)
   }
 
-  /**
-   * A fiber waiting for `n` permits. The waiter is granted under the
-   * semaphore's lock, which sets `granted` and hands the fiber's resumption
-   * callback back to the granter; a waiter that is interrupted before being
-   * granted is removed from the queue under the same lock.
-   */
   private val resumeNow: Either[Nothing, Exit[Nothing, Unit]] = Right(Exit.unit)
   private val noFiber: () => FiberId                          = () => FiberId.None
 
+  /**
+   * A fiber waiting for `n` permits. All fields are guarded by the owning
+   * semaphore's lock. `woken` is set when the semaphore hands the waiter its
+   * resumption, either because it was granted its permits (fair) or because it
+   * should retry for them (unfair); `holding` is set once the waiter owns its
+   * permits.
+   */
   private final class Waiter(val n: Long) {
     var callback: ZIO[Any, Nothing, Unit] => Unit = null
-    var granted: Boolean                          = false
+    var woken: Boolean                            = false
+    var holding: Boolean                          = false
   }
 
-  private final class Impl(initial: Long) extends Semaphore {
+  /**
+   * The parts shared by both implementations: a counter of free permits with a
+   * lock-free fast path, a lock-guarded FIFO queue of waiters, and the
+   * `withPermits` family built on `reserve`, `await`, `release` and
+   * `cancelOrRelease`.
+   */
+  private sealed abstract class Base(initial: Long) extends Semaphore {
 
     /**
-     * Permits not held by anyone. Acquired on the fast path with a single CAS
-     * when `hasWaiters` is false; released with a single atomic add.
+     * Permits not held by anyone. Taken on the fast path with a single CAS and
+     * returned with a single atomic add.
      */
-    private[this] val permits = new java.util.concurrent.atomic.AtomicLong(initial)
+    protected final val permits = new java.util.concurrent.atomic.AtomicLong(initial)
 
     /**
      * True whenever `waiters` may be non-empty. Written under the lock, read
-     * without it: an acquirer that reads `false` may take permits directly, one
-     * that reads `true` must queue behind the existing waiters, which keeps the
-     * semaphore FIFO. A waiter publishes `true` before re-reading `permits`,
-     * and a releaser adds to `permits` before reading this flag, so one of the
-     * two always observes the other and no wakeup is lost.
+     * without it. A waiter publishes `true` before re-reading `permits`, and a
+     * releaser adds to `permits` before reading this flag, so one of the two
+     * always observes the other and no wakeup is lost.
      */
-    @volatile private[this] var hasWaiters: Boolean = false
+    @volatile protected final var hasWaiters: Boolean = false
 
     /** Guarded by `this`. */
-    private[this] val waiters = new java.util.ArrayDeque[Waiter]
+    protected final val waiters = new java.util.ArrayDeque[Waiter]
 
-    def available(implicit trace: Trace): UIO[Long] =
-      ZIO.succeed(if (hasWaiters) 0L else permits.get)
+    /** Takes `n` permits now if the implementation's policy allows. */
+    protected def tryAcquire(n: Long): Boolean
 
-    override def awaiting(implicit trace: Trace): UIO[Long] =
-      ZIO.succeed(if (hasWaiters) synchronized(waiters.size.toLong) else 0L)
+    /** Takes `n` permits now, returning null, or queues a waiter for them. */
+    protected def reserve(n: Long): Waiter
 
-    def withPermit[R, E, A](zio: ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, A] =
+    /** Suspends until the waiter holds its permits. */
+    protected def await(waiter: Waiter)(implicit trace: Trace): UIO[Unit]
+
+    /** Returns `n` permits and wakes queued fibers as appropriate. */
+    protected def release(n: Long): Unit
+
+    /**
+     * Cleans up after a waiter whose owner is done with it: a waiter still
+     * queued is removed, one that holds permits returns them.
+     */
+    protected def cancelOrRelease(waiter: Waiter): Unit
+
+    final def withPermit[R, E, A](zio: ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, A] =
       withPermits(1L)(zio)
 
-    def withPermitScoped(implicit trace: Trace): ZIO[Scope, Nothing, Unit] =
+    final def withPermitScoped(implicit trace: Trace): ZIO[Scope, Nothing, Unit] =
       withPermitsScoped(1L)
 
-    def withPermits[R, E, A](n: Long)(zio: ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, A] =
+    final def withPermits[R, E, A](n: Long)(zio: ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, A] =
       if (n < 0L) negative(n)
       else if (n == 0L) zio
       else
@@ -165,7 +199,7 @@ object Semaphore {
             )
         }
 
-    def withPermitsScoped(n: Long)(implicit trace: Trace): ZIO[Scope, Nothing, Unit] =
+    final def withPermitsScoped(n: Long)(implicit trace: Trace): ZIO[Scope, Nothing, Unit] =
       if (n < 0L) negative(n)
       else if (n == 0L) ZIO.unit
       else
@@ -175,7 +209,9 @@ object Semaphore {
           }
           .flatMap(waiter => if (waiter eq null) ZIO.unit else await(waiter))
 
-    override def tryWithPermits[R, E, A](n: Long)(zio: ZIO[R, E, A])(implicit trace: Trace): ZIO[R, E, Option[A]] =
+    final override def tryWithPermits[R, E, A](n: Long)(zio: ZIO[R, E, A])(implicit
+      trace: Trace
+    ): ZIO[R, E, Option[A]] =
       if (n < 0L) negative(n)
       else if (n == 0L) zio.asSome
       else
@@ -191,21 +227,60 @@ object Semaphore {
     private def negative(n: Long)(implicit trace: Trace): UIO[Nothing] =
       ZIO.die(new IllegalArgumentException(s"Unexpected negative `$n` permits requested."))
 
-    /**
-     * Takes `n` permits if they are available and nobody is queued ahead.
-     */
+    /** Takes `n` permits if available, ignoring any waiters. */
     @tailrec
-    private def tryAcquire(n: Long): Boolean = {
+    protected final def takePermits(n: Long): Boolean = {
+      val current = permits.get
+      if (current < n) false
+      else if (permits.compareAndSet(current, current - n)) true
+      else takePermits(n)
+    }
+
+    /**
+     * Suspends the fiber until the semaphore wakes the waiter. If the fiber is
+     * interrupted first, the wakeup may still arrive and is then dropped by the
+     * runtime, so the waiter's owner must call `cancelOrRelease` afterwards.
+     */
+    protected final def suspend(waiter: Waiter)(implicit trace: Trace): UIO[Unit] =
+      ZIO.Async[Any, Nothing, Unit](
+        trace,
+        callback => {
+          val done = synchronized {
+            if (waiter.woken) true
+            else {
+              waiter.callback = callback
+              false
+            }
+          }
+          // A null result registers no interrupt handler, see above.
+          if (done) Semaphore.resumeNow else null
+        },
+        Semaphore.noFiber
+      )
+  }
+
+  /**
+   * The FIFO semaphore. `hasWaiters` gates the fast path, so once a fiber is
+   * queued every later arrival queues behind it, and a release hands permits to
+   * the head of the queue directly.
+   */
+  private final class Fair(initial: Long) extends Base(initial) {
+
+    def available(implicit trace: Trace): UIO[Long] =
+      ZIO.succeed(if (hasWaiters) 0L else permits.get)
+
+    override def awaiting(implicit trace: Trace): UIO[Long] =
+      ZIO.succeed(if (hasWaiters) synchronized(waiters.size.toLong) else 0L)
+
+    @tailrec
+    protected def tryAcquire(n: Long): Boolean = {
       val current = permits.get
       if (hasWaiters || current < n) false
       else if (permits.compareAndSet(current, current - n)) true
       else tryAcquire(n)
     }
 
-    /**
-     * Takes `n` permits now, returning null, or queues a waiter for them.
-     */
-    private def reserve(n: Long): Waiter =
+    protected def reserve(n: Long): Waiter =
       if (tryAcquire(n)) null
       else
         synchronized {
@@ -221,75 +296,40 @@ object Semaphore {
           }
         }
 
-    /** Takes `n` permits if available, regardless of `hasWaiters`. */
-    @tailrec
-    private def takePermits(n: Long): Boolean = {
-      val current = permits.get
-      if (current < n) false
-      else if (permits.compareAndSet(current, current - n)) true
-      else takePermits(n)
-    }
+    /** A fair waiter is woken only once it holds its permits. */
+    protected def await(waiter: Waiter)(implicit trace: Trace): UIO[Unit] =
+      suspend(waiter)
 
-    /**
-     * Suspends the fiber until the waiter is granted. If the fiber is
-     * interrupted first, the grant may still arrive and is then dropped by the
-     * runtime, so the waiter's owner must call `cancelOrRelease` afterwards.
-     */
-    private def await(waiter: Waiter)(implicit trace: Trace): UIO[Unit] =
-      ZIO.Async[Any, Nothing, Unit](
-        trace,
-        callback => {
-          val done = synchronized {
-            if (waiter.granted) true
-            else {
-              waiter.callback = callback
-              false
-            }
-          }
-          // A null result registers no interrupt handler: an interrupted waiter is
-          // cleaned up by its owner through `cancelOrRelease`, and a grant that
-          // races with the interrupt is dropped by the runtime.
-          if (done) Semaphore.resumeNow else null
-        },
-        Semaphore.noFiber
-      )
-
-    /**
-     * Returns `n` permits and wakes as many queued fibers as they satisfy, in
-     * FIFO order.
-     */
-    private def release(n: Long): Unit = {
+    protected def release(n: Long): Unit = {
       permits.addAndGet(n)
       if (hasWaiters) drain()
     }
 
-    /**
-     * Removes a waiter that was never granted, or returns its permits if it
-     * was.
-     */
-    private def cancelOrRelease(waiter: Waiter): Unit = {
-      val granted = synchronized {
-        if (waiter.granted) true
+    protected def cancelOrRelease(waiter: Waiter): Unit = {
+      val holding = synchronized {
+        if (waiter.holding) true
         else {
           waiters.remove(waiter)
           if (waiters.isEmpty) hasWaiters = false
           false
         }
       }
-      if (granted) release(waiter.n)
+      if (holding) release(waiter.n)
       else if (hasWaiters) drain() // the removed waiter may have been blocking smaller requests
     }
 
+    /** Grants as many queued fibers as the free permits satisfy, in order. */
     @tailrec
     private def drain(): Unit = {
       var granted = false
       // The callback is read under the lock: a waiter that registers after this
-      // sees `granted` and resumes itself instead.
+      // sees `woken` and resumes itself instead.
       val callback = synchronized {
         val head = waiters.peekFirst
         if ((head ne null) && takePermits(head.n)) {
           waiters.pollFirst()
-          head.granted = true
+          head.holding = true
+          head.woken = true
           granted = true
           if (waiters.isEmpty) hasWaiters = false
           head.callback
@@ -299,6 +339,104 @@ object Semaphore {
         if (callback ne null) callback(Exit.unit)
         drain()
       }
+    }
+  }
+
+  /**
+   * The unfair semaphore. The fast path ignores waiters, so a fiber that
+   * releases and re-acquires keeps running. A release wakes the head waiter to
+   * retry, but only if no woken waiter is already retrying, so a fiber that
+   * keeps the permits hot pays for at most one wakeup at a time. A waiter that
+   * loses its retry goes back to the front of the queue.
+   */
+  private final class Unfair(initial: Long) extends Base(initial) {
+
+    /** Guarded by `this`: a waiter has been woken and has not yet retried. */
+    private[this] var retrying: Waiter = null
+
+    def available(implicit trace: Trace): UIO[Long] =
+      ZIO.succeed(permits.get)
+
+    override def awaiting(implicit trace: Trace): UIO[Long] =
+      ZIO.succeed(synchronized(waiters.size.toLong + (if (retrying eq null) 0L else 1L)))
+
+    protected def tryAcquire(n: Long): Boolean = takePermits(n)
+
+    protected def reserve(n: Long): Waiter =
+      if (takePermits(n)) null
+      else synchronized(enqueue(new Waiter(n), atFront = false))
+
+    /**
+     * Queues the waiter unless the permits arrived meanwhile. The caller holds
+     * the lock.
+     */
+    private def enqueue(waiter: Waiter, atFront: Boolean): Waiter = {
+      // Publish the flag before re-reading the permits (see `hasWaiters`).
+      hasWaiters = true
+      if (takePermits(waiter.n)) {
+        waiter.holding = true
+        if (waiters.isEmpty) hasWaiters = false
+        null
+      } else {
+        if (atFront) waiters.addFirst(waiter) else waiters.addLast(waiter)
+        waiter
+      }
+    }
+
+    /**
+     * Sleeps until woken, then retries; a lost retry re-queues at the front and
+     * sleeps again.
+     */
+    protected def await(waiter: Waiter)(implicit trace: Trace): UIO[Unit] =
+      suspend(waiter).flatMap { _ =>
+        val acquired = synchronized {
+          retrying = null
+          waiter.woken = false
+          if (takePermits(waiter.n)) {
+            waiter.holding = true
+            true
+          } else {
+            enqueue(waiter, atFront = true) eq null
+          }
+        }
+        if (acquired) ZIO.unit else await(waiter)
+      }
+
+    protected def release(n: Long): Unit = {
+      permits.addAndGet(n)
+      if (hasWaiters) wakeHead()
+    }
+
+    protected def cancelOrRelease(waiter: Waiter): Unit = {
+      val holding = synchronized {
+        if (waiter.holding) true
+        else {
+          if (retrying eq waiter) retrying = null
+          waiters.remove(waiter)
+          if (waiters.isEmpty) hasWaiters = false
+          false
+        }
+      }
+      if (holding) release(waiter.n)
+      else if (hasWaiters) wakeHead()
+    }
+
+    /** Wakes the head waiter to retry unless one is already retrying. */
+    private def wakeHead(): Unit = {
+      val callback = synchronized {
+        if (retrying ne null) null
+        else {
+          val head = waiters.pollFirst()
+          if (head eq null) null
+          else {
+            retrying = head
+            head.woken = true
+            if (waiters.isEmpty) hasWaiters = false
+            head.callback
+          }
+        }
+      }
+      if (callback ne null) callback(Exit.unit)
     }
   }
 }
