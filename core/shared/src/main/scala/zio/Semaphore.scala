@@ -151,10 +151,10 @@ object Semaphore {
       if (n < 0L) negative(n)
       else if (n == 0L) zio
       else
-        ZIO.uninterruptibleMask { restore =>
+        ZIO.suspendSucceed {
           val waiter = reserve(n)
           if (waiter eq null)
-            restore(zio).foldCauseZIO(
+            zio.foldCauseZIO(
               cause => { release(n); Exit.failCause(cause) },
               a => { release(n); Exit.succeed(a) }
             )
