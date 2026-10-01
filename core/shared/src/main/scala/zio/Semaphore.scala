@@ -159,7 +159,7 @@ object Semaphore {
               a => { release(n); Exit.succeed(a) }
             )
           else
-            restore(await(waiter).flatMap(_ => zio)).foldCauseZIO(
+            await(waiter).flatMap(_ => zio).foldCauseZIO(
               cause => { cancelOrRelease(waiter); Exit.failCause(cause) },
               a => { release(n); Exit.succeed(a) }
             )
