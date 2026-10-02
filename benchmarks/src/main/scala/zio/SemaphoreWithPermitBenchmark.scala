@@ -72,4 +72,29 @@ class SemaphoreWithPermitBenchmark {
       fiber <- ZIO.forkAll(List.fill(fibers)(repeat(ops)(ZIO.succeed(bh.consume(1)))))
       _     <- fiber.join
     } yield ())
+
+  // One semaphore for the whole trial, so it lives long enough to be promoted
+  // and to have the collector place its waiter queue wherever it will.
+  var longLivedFair: Semaphore   = _
+  var longLivedUnfair: Semaphore = _
+
+  @Setup(Level.Trial)
+  def setup(): Unit = {
+    longLivedFair = Unsafe.unsafe(implicit unsafe => Semaphore.unsafe.make(permits.toLong))
+    longLivedUnfair = Unsafe.unsafe(implicit unsafe => Semaphore.unsafe.makeUnfair(permits.toLong))
+  }
+
+  @Benchmark
+  def zioSemaphoreLongLived(bh: Blackhole): Unit =
+    unsafeRun(for {
+      fiber <- ZIO.forkAll(List.fill(fibers)(repeat(ops)(longLivedFair.withPermit(Exit.succeed(bh.consume(1))))))
+      _     <- fiber.join
+    } yield ())
+
+  @Benchmark
+  def zioSemaphoreUnfairLongLived(bh: Blackhole): Unit =
+    unsafeRun(for {
+      fiber <- ZIO.forkAll(List.fill(fibers)(repeat(ops)(longLivedUnfair.withPermit(Exit.succeed(bh.consume(1))))))
+      _     <- fiber.join
+    } yield ())
 }
