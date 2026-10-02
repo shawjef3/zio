@@ -51,22 +51,6 @@ public abstract class SemaphorePermits extends SemaphorePermitsPadding1 implemen
 }
 
 abstract class SemaphorePermitsPadding0 implements Serializable {
-    protected long p000;
-    protected long p001;
-    protected long p002;
-    protected long p003;
-    protected long p004;
-    protected long p005;
-    protected long p006;
-    protected long p007;
-    protected long p008;
-    protected long p009;
-    protected long p010;
-    protected long p011;
-    protected long p012;
-    protected long p013;
-    protected long p014;
-    protected long p015;
 }
 
 abstract class SemaphorePermitsValue extends SemaphorePermitsPadding0 implements Serializable {
@@ -74,20 +58,4 @@ abstract class SemaphorePermitsValue extends SemaphorePermitsPadding0 implements
 }
 
 abstract class SemaphorePermitsPadding1 extends SemaphorePermitsValue implements Serializable {
-    protected long p100;
-    protected long p101;
-    protected long p102;
-    protected long p103;
-    protected long p104;
-    protected long p105;
-    protected long p106;
-    protected long p107;
-    protected long p108;
-    protected long p109;
-    protected long p110;
-    protected long p111;
-    protected long p112;
-    protected long p113;
-    protected long p114;
-    protected long p115;
 }
