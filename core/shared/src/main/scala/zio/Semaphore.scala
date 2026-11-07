@@ -149,7 +149,7 @@ object Semaphore {
               case other => None -> other
             }
 
-        private val releaseOne: UIO[Any] = releaseN(1L)
+        private val releaseOne: UIO[Any] = releaseN(1L)(Trace.empty)
 
         def reserve(n: Long)(implicit trace: Trace): UIO[Reservation] =
           if (n < 0)
