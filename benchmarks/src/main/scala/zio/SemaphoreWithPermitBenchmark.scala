@@ -38,6 +38,28 @@ class SemaphoreWithPermitBenchmark {
       _     <- fiber.join
     } yield ())
 
+  // Each call opens and closes its own scope, so these rows include the cost
+  // of `ZIO.scoped` as well as the semaphore's scoped acquisition.
+  @Benchmark
+  def zioSemaphoreScoped(bh: Blackhole): Unit =
+    unsafeRun(for {
+      sem <- Semaphore.make(permits.toLong)
+      fiber <- ZIO.forkAll(
+                 List.fill(fibers)(repeat(ops)(ZIO.scoped(sem.withPermitScoped *> ZIO.succeed(bh.consume(1)))))
+               )
+      _ <- fiber.join
+    } yield ())
+
+  @Benchmark
+  def zioSemaphoreUnfairScoped(bh: Blackhole): Unit =
+    unsafeRun(for {
+      sem <- Semaphore.makeUnfair(permits.toLong)
+      fiber <- ZIO.forkAll(
+                 List.fill(fibers)(repeat(ops)(ZIO.scoped(sem.withPermitScoped *> ZIO.succeed(bh.consume(1)))))
+               )
+      _ <- fiber.join
+    } yield ())
+
   // The Java rows call the blocking `acquire()` inside `ZIO.succeed`, on the
   // compute pool. Uncontended, it never blocks, so those rows show a lock's
   // cost with no fiber machinery around it. Contended, every waiter parks the
